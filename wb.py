@@ -13,7 +13,7 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
@@ -30,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
 )
-logger = logging.getLogger("wb_bot")
+logger = logging.getLogger("wb_absolute_bot")
 
 
 def get_bot_token() -> str:
@@ -51,444 +51,782 @@ def get_bot_token() -> str:
 
 
 BOT_TOKEN = get_bot_token()
-PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 DB_PATH = BASE_DIR / "wb_tracker.db"
 
 WB_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
     ),
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
     "Origin": "https://www.wildberries.ru",
     "Referer": "https://www.wildberries.ru/",
 }
 
 LAST_SEARCH_QUERY: Dict[int, str] = {}
+WAITING_TARGET_PRICE: Dict[int, str] = {}
 BASKET_HOST_CACHE: Dict[int, str] = {}
 
 
 # ==========================================
-# 1. БАЗА ДАННЫХ (SQLite)
+# 1. АРХИТЕКТУРА БАЗЫ ДАННЫХ (SQLite WAL)
 # ==========================================
-def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tracked_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                nm_id TEXT NOT NULL,
-                title TEXT,
-                brand TEXT,
-                last_price REAL,
-                min_seen_price REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, nm_id)
+class Database:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tracked_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    nm_id TEXT NOT NULL,
+                    title TEXT,
+                    brand TEXT,
+                    last_price REAL DEFAULT 0,
+                    min_seen_price REAL DEFAULT 0,
+                    target_price REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, nm_id)
+                )
+                """
             )
-            """
-        )
-        conn.commit()
+            # Миграция для старых таблиц без target_price
+            try:
+                cursor.execute("ALTER TABLE tracked_items ADD COLUMN target_price REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+            # Локальный индекс просмотренных и связанных товаров для мгновенного поиска
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS catalog_cache (
+                    nm_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    brand TEXT,
+                    subj_name TEXT,
+                    price REAL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+            conn.commit()
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM bot_settings WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
+                (key, value.strip()),
+            )
+            conn.commit()
+
+    def cache_product(self, nm_id: str, title: str, brand: str, subj: str, price: float) -> None:
+        if not nm_id or title == "Без названия":
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO catalog_cache (nm_id, title, brand, subj_name, price, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (str(nm_id), title, brand, subj, price),
+            )
+            conn.commit()
+
+    def search_cached_nm_ids(self, query: str) -> List[str]:
+        words = [w.lower() for w in re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]{3,}", query)]
+        if not words:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT nm_id, title, brand, subj_name FROM catalog_cache ORDER BY updated_at DESC LIMIT 300"
+            ).fetchall()
+        matched = []
+        for nm_id, title, brand, subj in rows:
+            haystack = f"{title} {brand} {subj}".lower()
+            if all(w in haystack for w in words):
+                matched.append(nm_id)
+        return matched[:15]
+
+    def save_item(
+        self,
+        user_id: int,
+        nm_id: str,
+        title: str,
+        brand: str,
+        price: float,
+        hist_min: float = 0.0,
+        target_price: Optional[float] = None,
+    ) -> None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT min_seen_price, target_price FROM tracked_items WHERE user_id = ? AND nm_id = ?",
+                (user_id, nm_id),
+            ).fetchone()
+
+            candidates = [p for p in (price, hist_min, row[0] if row else 0) if p and p > 0]
+            min_price = min(candidates) if candidates else price
+            t_price = target_price if target_price is not None else (row[1] if row and row[1] else 0.0)
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tracked_items
+                (user_id, nm_id, title, brand, last_price, min_seen_price, target_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, nm_id, title, brand, price, min_price, t_price),
+            )
+            conn.commit()
+
+    def set_target_price(self, user_id: int, nm_id: str, target_price: float) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE tracked_items SET target_price = ? WHERE user_id = ? AND nm_id = ?",
+                (target_price, user_id, nm_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def update_price(self, user_id: int, nm_id: str, new_price: float) -> None:
+        if new_price <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE tracked_items
+                SET last_price = ?,
+                    min_seen_price = CASE
+                        WHEN min_seen_price IS NULL OR min_seen_price <= 0 OR ? < min_seen_price THEN ?
+                        ELSE min_seen_price
+                    END
+                WHERE user_id = ? AND nm_id = ?
+                """,
+                (new_price, new_price, new_price, user_id, nm_id),
+            )
+            conn.commit()
+
+    def get_user_items(self, user_id: int) -> List[Tuple[str, str, str, float, float, float]]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT nm_id, title, brand, last_price, min_seen_price, COALESCE(target_price, 0)
+                FROM tracked_items
+                WHERE user_id = ?
+                ORDER BY id DESC
+                """,
+                (user_id,),
+            ).fetchall()
+
+    def get_all_items(self) -> List[Tuple[int, str, str, str, float, float]]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT user_id, nm_id, title, brand, last_price, COALESCE(target_price, 0) FROM tracked_items"
+            ).fetchall()
+
+    def delete_item(self, user_id: int, nm_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM tracked_items WHERE user_id = ? AND nm_id = ?",
+                (user_id, nm_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def clear_user_items(self, user_id: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM tracked_items WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return cur.rowcount
 
 
-def save_tracked_item(
-    user_id: int, nm_id: str, title: str, brand: str, price: float
-) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT min_seen_price FROM tracked_items WHERE user_id = ? AND nm_id = ?",
-            (user_id, nm_id),
-        )
-        row = cursor.fetchone()
-        min_price = min(price, row[0]) if (row and row[0] and row[0] > 0 and price > 0) else price
-
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO tracked_items
-            (user_id, nm_id, title, brand, last_price, min_seen_price)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, nm_id, title, brand, price, min_price),
-        )
-        conn.commit()
-
-
-def update_item_price_in_db(user_id: int, nm_id: str, new_price: float) -> None:
-    if new_price <= 0:
-        return
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE tracked_items
-            SET last_price = ?,
-                min_seen_price = CASE
-                    WHEN min_seen_price IS NULL OR min_seen_price <= 0 OR ? < min_seen_price THEN ?
-                    ELSE min_seen_price
-                END
-            WHERE user_id = ? AND nm_id = ?
-            """,
-            (new_price, new_price, new_price, user_id, nm_id),
-        )
-        conn.commit()
-
-
-def get_user_items(user_id: int) -> List[Tuple[str, str, str, float, float]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT nm_id, title, brand, last_price, min_seen_price
-            FROM tracked_items
-            WHERE user_id = ?
-            ORDER BY id DESC
-            """,
-            (user_id,),
-        )
-        return cursor.fetchall()
-
-
-def get_all_tracked_items() -> List[Tuple[int, str, str, str, float]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT user_id, nm_id, title, brand, last_price FROM tracked_items"
-        )
-        return cursor.fetchall()
-
-
-def delete_tracked_item(user_id: int, nm_id: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM tracked_items WHERE user_id = ? AND nm_id = ?",
-            (user_id, nm_id),
-        )
-        conn.commit()
-        return cursor.rowcount > 0
-
-
-def clear_user_items(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM tracked_items WHERE user_id = ?", (user_id,))
-        conn.commit()
-        return cursor.rowcount
+db = Database(DB_PATH)
 
 
 # ==========================================
-# 2. КАСКАДНЫЙ ПАРСИНГ WILDBERRIES (v4 + Search + CDN Basket)
+# 2. ДВИЖОК WILDBERRIES (CDN + API v4 + ГИБРИДНЫЙ ПОИСК)
 # ==========================================
-def get_basket_number_by_vol(vol: int) -> str:
-    """Определяет номер CDN-сервера basket-{NN}.wbbasket.ru по volume артикула."""
-    ranges = [
-        (143, "01"), (287, "02"), (431, "03"), (719, "04"), (1007, "05"),
-        (1061, "06"), (1115, "07"), (1169, "08"), (1313, "09"), (1601, "10"),
-        (1655, "11"), (1919, "12"), (2045, "13"), (2189, "14"), (2405, "15"),
-        (2621, "16"), (2837, "17"), (3053, "18"), (3269, "19"), (3485, "20"),
-        (3701, "21"), (3917, "22"), (4133, "23"), (4349, "24"), (4565, "25"),
-        (4877, "26"), (5189, "27"), (5501, "28"), (5813, "29"), (6125, "30"),
-        (6437, "31"), (6749, "32"), (7061, "33"), (7373, "34"), (7685, "35"),
-    ]
-    for max_vol, b_num in ranges:
-        if vol <= max_vol:
-            return b_num
-    return "36"
+class WildberriesEngine:
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
 
+    @property
+    def proxy_url(self) -> Optional[str]:
+        db_proxy = db.get_setting("proxy_url", "").strip()
+        if db_proxy:
+            return db_proxy
+        env_proxy = os.getenv("PROXY_URL", "").strip()
+        return env_proxy or None
 
-def extract_products_list(data: Any) -> List[Dict[str, Any]]:
-    """Извлекает массив products из любого формата ответа WB (v4, v2, search)."""
-    if not isinstance(data, dict):
+    async def get_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            connector = aiohttp.TCPConnector(
+                family=socket.AF_INET,
+                ssl=False,
+                limit=40,
+                ttl_dns_cache=600,
+            )
+            timeout = aiohttp.ClientTimeout(total=12, connect=5)
+            self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        return self.session
+
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    @staticmethod
+    def get_basket_number(vol: int) -> str:
+        ranges = [
+            (143, "01"), (287, "02"), (431, "03"), (719, "04"), (1007, "05"),
+            (1061, "06"), (1115, "07"), (1169, "08"), (1313, "09"), (1601, "10"),
+            (1655, "11"), (1919, "12"), (2045, "13"), (2189, "14"), (2405, "15"),
+            (2621, "16"), (2837, "17"), (3053, "18"), (3269, "19"), (3485, "20"),
+            (3701, "21"), (3917, "22"), (4133, "23"), (4349, "24"), (4565, "25"),
+            (4877, "26"), (5189, "27"), (5501, "28"), (5813, "29"), (6125, "30"),
+            (6437, "31"), (6749, "32"), (7061, "33"), (7373, "34"), (7685, "35"),
+        ]
+        for max_vol, b_num in ranges:
+            if vol <= max_vol:
+                return b_num
+        return "36"
+
+    @staticmethod
+    def _extract_products(data: Any) -> List[Dict[str, Any]]:
+        if not isinstance(data, dict):
+            return []
+        if isinstance(data.get("products"), list) and data["products"]:
+            return data["products"]
+        nested = data.get("data")
+        if isinstance(nested, dict) and isinstance(nested.get("products"), list):
+            return nested["products"]
         return []
-    if isinstance(data.get("products"), list) and data["products"]:
-        return data["products"]
-    nested = data.get("data")
-    if isinstance(nested, dict) and isinstance(nested.get("products"), list):
-        return nested["products"]
-    return []
 
+    @staticmethod
+    def _parse_commercial_prod(prod: Dict[str, Any]) -> Dict[str, Any]:
+        nm_id = str(prod.get("id") or prod.get("nm_id") or "")
+        title = str(prod.get("name") or prod.get("imt_name") or "Без названия").strip()
+        brand = str(prod.get("brand") or "Без бренда").strip() or "Без бренда"
+        rating = float(
+            prod.get("reviewRating") or prod.get("rating") or prod.get("nmReviewRating") or 0.0
+        )
+        feedbacks = int(prod.get("feedbacks") or prod.get("nmFeedbacks") or 0)
 
-def extract_product_metrics(prod: Dict[str, Any]) -> Dict[str, Any]:
-    """Парсит цену, скидку, рейтинг и остатки из коммерческой карточки WB."""
-    nm_id = str(prod.get("id") or prod.get("nm_id") or "")
-    title = str(prod.get("name") or prod.get("imt_name") or "Без названия").strip()
-    brand = str(prod.get("brand") or "Без бренда").strip() or "Без бренда"
-    rating = float(prod.get("reviewRating") or prod.get("rating") or prod.get("nmReviewRating") or 0.0)
-    feedbacks = int(prod.get("feedbacks") or prod.get("nmFeedbacks") or 0)
+        min_price = float("inf")
+        basic_price = 0.0
+        total_qty = 0
 
-    min_price = float("inf")
-    basic_price = 0.0
-    total_qty = 0
+        for s in prod.get("sizes", []):
+            for st in s.get("stocks", []):
+                total_qty += int(st.get("qty", 0))
+            price_obj = s.get("price", {})
+            if isinstance(price_obj, dict):
+                p_curr = (
+                    price_obj.get("product")
+                    or price_obj.get("total")
+                    or price_obj.get("basic")
+                    or 0
+                ) / 100.0
+                p_base = (price_obj.get("basic") or 0) / 100.0
+                if 0 < p_curr < min_price:
+                    min_price = p_curr
+                    basic_price = p_base
 
-    sizes = prod.get("sizes", [])
-    for s in sizes:
-        stocks = s.get("stocks", [])
-        for st in stocks:
-            total_qty += int(st.get("qty", 0))
+        if min_price == float("inf"):
+            sale_u = (prod.get("salePriceU") or prod.get("priceU") or 0) / 100.0
+            min_price = sale_u if sale_u > 0 else 0.0
+            basic_price = (prod.get("priceU") or 0) / 100.0
 
-        price_obj = s.get("price", {})
-        if isinstance(price_obj, dict):
-            p_curr = (
-                price_obj.get("product")
-                or price_obj.get("total")
-                or price_obj.get("basic")
-                or 0
-            ) / 100.0
-            p_base = (price_obj.get("basic") or 0) / 100.0
-            if 0 < p_curr < min_price:
-                min_price = p_curr
-                basic_price = p_base
+        if total_qty == 0 and prod.get("totalQuantity"):
+            total_qty = int(prod.get("totalQuantity", 0))
 
-    if min_price == float("inf"):
-        sale_u = (prod.get("salePriceU") or prod.get("priceU") or 0) / 100.0
-        min_price = sale_u if sale_u > 0 else 0.0
-        basic_price = (prod.get("priceU") or 0) / 100.0
+        discount_pct = 0
+        if basic_price > min_price > 0:
+            discount_pct = round((1 - min_price / basic_price) * 100)
 
-    if total_qty == 0 and prod.get("totalQuantity"):
-        total_qty = int(prod.get("totalQuantity", 0))
-
-    discount_pct = 0
-    if basic_price > min_price > 0:
-        discount_pct = round((1 - min_price / basic_price) * 100)
-
-    return {
-        "id": nm_id,
-        "title": title,
-        "brand": brand,
-        "price": min_price,
-        "old_price": basic_price,
-        "discount": discount_pct,
-        "rating": rating,
-        "feedbacks": feedbacks,
-        "qty": total_qty,
-        "history_min": 0.0,
-        "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
-    }
-
-
-async def fetch_cdn_basket_data(
-    session: aiohttp.ClientSession, nm_id: str
-) -> Dict[str, Any]:
-    """
-    Запрашивает статическую карточку card.json и историю цен price-history.json
-    напрямую с CDN-серверов wbbasket.ru (не блокируется на зарубежных IP Render).
-    """
-    try:
-        nm_int = int(nm_id)
-    except ValueError:
-        return {}
-
-    vol = nm_int // 100000
-    part = nm_int // 1000
-    rel_path = f"/vol{vol}/part{part}/{nm_int}/info"
-
-    primary_b = BASKET_HOST_CACHE.get(vol) or get_basket_number_by_vol(vol)
-    primary_int = int(primary_b)
-
-    # Проверяем основную корзину и соседние на случай сдвига шардов WB
-    candidates = [primary_b]
-    for offset in (-1, 1, -2, 2, 3, 4):
-        cand_num = primary_int + offset
-        if 1 <= cand_num <= 40:
-            cand_str = f"{cand_num:02d}"
-            if cand_str not in candidates:
-                candidates.append(cand_str)
-
-    card_data: Dict[str, Any] = {}
-    working_host: Optional[str] = None
-
-    for b_num in candidates:
-        host = f"https://basket-{b_num}.wbbasket.ru"
-        card_url = f"{host}{rel_path}/ru/card.json"
-        try:
-            async with session.get(card_url, headers=WB_HEADERS, timeout=4) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, dict) and (data.get("imt_name") or data.get("subj_name") or data.get("nm_id")):
-                        card_data = data
-                        working_host = host
-                        BASKET_HOST_CACHE[vol] = b_num
-                        break
-        except Exception:
-            continue
-
-    if not card_data or not working_host:
-        return {}
-
-    title = (
-        card_data.get("imt_name")
-        or card_data.get("subj_name")
-        or "Товар Wildberries"
-    )
-    selling = card_data.get("selling", {})
-    brand = (
-        selling.get("brand_name")
-        or card_data.get("brand_name")
-        or "Без бренда"
-    )
-
-    # Запрашиваем историю цен с того же CDN-хоста
-    latest_hist_price = 0.0
-    min_hist_price = 0.0
-    hist_url = f"{working_host}{rel_path}/price-history.json"
-    try:
-        async with session.get(hist_url, headers=WB_HEADERS, timeout=4) as resp:
-            if resp.status == 200:
-                hist_list = await resp.json(content_type=None)
-                if isinstance(hist_list, list) and hist_list:
-                    rub_prices = [
-                        (item.get("price", {}).get("RUB") or 0) / 100.0
-                        for item in hist_list
-                        if isinstance(item, dict) and item.get("price", {}).get("RUB")
-                    ]
-                    if rub_prices:
-                        latest_hist_price = rub_prices[-1]
-                        min_hist_price = min(rub_prices)
-    except Exception:
-        pass
-
-    return {
-        "title": str(title).strip(),
-        "brand": str(brand).strip(),
-        "latest_hist_price": latest_hist_price,
-        "min_hist_price": min_hist_price,
-    }
-
-
-async def get_wb_product_by_id(
-    session: aiohttp.ClientSession, nm_id: str
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Каскадный поиск карточки по артикулу:
-    1. Коммерческий API cards/v4/detail (основной + зеркало u-card)
-    2. Поисковый шлюз search.wb.ru по номеру артикула
-    3. Прямой CDN wbbasket.ru (card.json + price-history.json)
-    """
-    detail_urls = [
-        f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}",
-        f"https://u-card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}",
-        f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}",
-        f"https://search.wb.ru/exactmatch/ru/common/v18/search?appType=1&curr=rub&dest=-1257786&query={nm_id}&resultset=catalog&spp=30",
-        f"https://search.wb.ru/exactmatch/ru/common/v9/search?appType=1&curr=rub&dest=-1257786&query={nm_id}&resultset=catalog&spp=30",
-        f"https://search.wb.ru/exactmatch/ru/common/v7/search?appType=1&curr=rub&dest=-1257786&query={nm_id}&resultset=catalog&spp=30",
-    ]
-
-    # Параллельно запускаем получение метаданных и истории цен с CDN wbbasket
-    cdn_task = asyncio.create_task(fetch_cdn_basket_data(session, nm_id))
-
-    commercial_info: Optional[Dict[str, Any]] = None
-    for url in detail_urls:
-        try:
-            async with session.get(
-                url, headers=WB_HEADERS, proxy=PROXY_URL, timeout=6
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    products = extract_products_list(data)
-                    if products:
-                        # Ищем точное совпадение по артикулу
-                        target_prod = products[0]
-                        for p in products:
-                            if str(p.get("id")) == str(nm_id):
-                                target_prod = p
-                                break
-                        commercial_info = extract_product_metrics(target_prod)
-                        if commercial_info["price"] > 0 or commercial_info["title"] != "Без названия":
-                            break
-        except Exception as e:
-            logger.debug(f"Пропуск шлюза {url[:40]}: {e}")
-
-    cdn_data = await cdn_task
-
-    # Если сработал коммерческий шлюз — обогащаем его данными из CDN (точные имя/бренд и история цен)
-    if commercial_info:
-        if cdn_data:
-            if commercial_info["title"] in ("Без названия", ""):
-                commercial_info["title"] = cdn_data["title"]
-            if commercial_info["brand"] in ("Без бренда", ""):
-                commercial_info["brand"] = cdn_data["brand"]
-            commercial_info["history_min"] = cdn_data.get("min_hist_price", 0.0)
-            if commercial_info["price"] <= 0 and cdn_data.get("latest_hist_price", 0) > 0:
-                commercial_info["price"] = cdn_data["latest_hist_price"]
-        return True, commercial_info
-
-    # Если коммерческий API заблокировал запрос или товар архивный, но CDN отдал карточку
-    if cdn_data:
-        return True, {
+        return {
             "id": nm_id,
-            "title": cdn_data["title"],
-            "brand": cdn_data["brand"],
-            "price": cdn_data.get("latest_hist_price", 0.0),
-            "old_price": 0.0,
-            "discount": 0,
-            "rating": 0.0,
-            "feedbacks": 0,
-            "qty": 0,
-            "history_min": cdn_data.get("min_hist_price", 0.0),
+            "title": title,
+            "brand": brand,
+            "subj_name": "",
+            "price": min_price,
+            "old_price": basic_price,
+            "discount": discount_pct,
+            "rating": rating,
+            "feedbacks": feedbacks,
+            "qty": total_qty,
+            "history_min": 0.0,
+            "history_max": 0.0,
+            "history_avg": 0.0,
+            "variants": [],
             "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
         }
 
-    return False, {"error": "Товар с таким артикулом не найден в базе Wildberries."}
-
-
-async def search_wb_lowest_prices(
-    session: aiohttp.ClientSession, query: str, mode: str = "smart"
-) -> Tuple[bool, List[Dict[str, Any]]]:
-    """Ищет самые низкие цены по ключевому слову через каскад версий Search API WB."""
-    encoded_q = quote(query.strip())
-    wb_sort = "popular" if mode == "smart" else "priceup"
-
-    search_urls = [
-        f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-        f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-        f"https://search.wb.ru/exactmatch/ru/common/v9/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-        f"https://search.wb.ru/exactmatch/ru/common/v7/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-        f"https://search.wb.ru/exactmatch/ru/common/v5/search?appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30",
-    ]
-
-    raw_products: List[Dict[str, Any]] = []
-    for url in search_urls:
+    async def fetch_cdn_basket(self, nm_id: str) -> Dict[str, Any]:
+        """Прямой запрос к CDN wbbasket.ru: карточка, связанные варианты (colors) и полная история цен."""
         try:
-            async with session.get(
-                url, headers=WB_HEADERS, proxy=PROXY_URL, timeout=8
-            ) as resp:
+            nm_int = int(nm_id)
+        except ValueError:
+            return {}
+
+        session = await self.get_session()
+        vol = nm_int // 100000
+        part = nm_int // 1000
+        rel_base = f"/vol{vol}/part{part}/{nm_int}"
+
+        primary_b = BASKET_HOST_CACHE.get(vol) or self.get_basket_number(vol)
+        primary_int = int(primary_b)
+
+        candidates = [primary_b]
+        for offset in (-1, 1, -2, 2, 3, 4):
+            c_num = primary_int + offset
+            if 1 <= c_num <= 40:
+                c_str = f"{c_num:02d}"
+                if c_str not in candidates:
+                    candidates.append(c_str)
+
+        card_data: Dict[str, Any] = {}
+        working_host: Optional[str] = None
+
+        for b_num in candidates:
+            host = f"https://basket-{b_num}.wbbasket.ru"
+            card_url = f"{host}{rel_base}/info/ru/card.json"
+            try:
+                async with session.get(card_url, headers=WB_HEADERS, timeout=4) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        if isinstance(data, dict) and (
+                            data.get("imt_name") or data.get("subj_name") or data.get("nm_id")
+                        ):
+                            card_data = data
+                            working_host = host
+                            BASKET_HOST_CACHE[vol] = b_num
+                            break
+            except Exception:
+                continue
+
+        if not card_data or not working_host:
+            return {}
+
+        title = str(
+            card_data.get("imt_name") or card_data.get("subj_name") or "Товар Wildberries"
+        ).strip()
+        subj_name = str(card_data.get("subj_name") or "").strip()
+        selling = card_data.get("selling", {})
+        brand = str(
+            selling.get("brand_name") or card_data.get("brand_name") or "Без бренда"
+        ).strip()
+
+        # Извлекаем все связанные артикулы (цвета / варианты модели)
+        variants: List[str] = []
+        raw_colors = card_data.get("colors") or []
+        for c in raw_colors:
+            if isinstance(c, int) or (isinstance(c, str) and c.isdigit()):
+                c_str = str(c)
+                if c_str != str(nm_id) and c_str not in variants:
+                    variants.append(c_str)
+            elif isinstance(c, dict) and c.get("nm_id"):
+                c_str = str(c["nm_id"])
+                if c_str != str(nm_id) and c_str not in variants:
+                    variants.append(c_str)
+
+        for fc in card_data.get("full_colors", []):
+            if isinstance(fc, dict) and fc.get("nm_id"):
+                c_str = str(fc["nm_id"])
+                if c_str != str(nm_id) and c_str not in variants:
+                    variants.append(c_str)
+
+        # Загружаем историю цен (price-history.json)
+        latest_price = 0.0
+        min_price = 0.0
+        max_price = 0.0
+        avg_price = 0.0
+
+        hist_url = f"{working_host}{rel_base}/info/price-history.json"
+        try:
+            async with session.get(hist_url, headers=WB_HEADERS, timeout=4) as resp:
                 if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    raw_products = extract_products_list(data)
-                    if raw_products:
-                        break
-        except Exception as e:
-            logger.debug(f"Пропуск поиска {url[:45]}: {e}")
+                    hist_list = await resp.json(content_type=None)
+                    if isinstance(hist_list, list) and hist_list:
+                        rub_prices = [
+                            (item.get("price", {}).get("RUB") or 0) / 100.0
+                            for item in hist_list
+                            if isinstance(item, dict) and item.get("price", {}).get("RUB")
+                        ]
+                        if rub_prices:
+                            latest_price = rub_prices[-1]
+                            min_price = min(rub_prices)
+                            max_price = max(rub_prices)
+                            avg_price = sum(rub_prices) / len(rub_prices)
+        except Exception:
+            pass
 
-    if not raw_products:
-        return False, []
+        db.cache_product(str(nm_id), title, brand, subj_name, latest_price)
 
-    parsed_list = []
-    for prod in raw_products:
-        item = extract_product_metrics(prod)
-        if item["price"] > 0:
-            parsed_list.append(item)
+        return {
+            "title": title,
+            "brand": brand,
+            "subj_name": subj_name,
+            "latest_hist_price": latest_price,
+            "min_hist_price": min_price,
+            "max_hist_price": max_price,
+            "avg_hist_price": avg_price,
+            "variants": variants[:10],
+        }
 
-    if not parsed_list:
-        return False, []
+    async def get_product_by_id(self, nm_id: str) -> Tuple[bool, Dict[str, Any]]:
+        session = await self.get_session()
+        proxy = self.proxy_url
 
-    if mode == "smart":
-        good_rated = [
-            p for p in parsed_list if p["rating"] >= 4.4 and p["feedbacks"] >= 5
+        detail_urls = [
+            f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}",
+            f"https://u-card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}",
+            f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={nm_id}",
+            f"https://search.wb.ru/exactmatch/ru/common/v18/search?appType=1&curr=rub&dest=-1257786&query={nm_id}&resultset=catalog&spp=30",
         ]
-        target_pool = good_rated if len(good_rated) >= 3 else parsed_list
-        target_pool.sort(key=lambda x: x["price"])
-        return True, target_pool[:7]
-    else:
-        parsed_list.sort(key=lambda x: x["price"])
-        return True, parsed_list[:7]
+
+        cdn_task = asyncio.create_task(self.fetch_cdn_basket(nm_id))
+
+        commercial_info: Optional[Dict[str, Any]] = None
+        for url in detail_urls:
+            try:
+                async with session.get(url, headers=WB_HEADERS, proxy=proxy, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        products = self._extract_products(data)
+                        if products:
+                            target = products[0]
+                            for p in products:
+                                if str(p.get("id")) == str(nm_id):
+                                    target = p
+                                    break
+                            commercial_info = self._parse_commercial_prod(target)
+                            if commercial_info["price"] > 0 or commercial_info["title"] != "Без названия":
+                                break
+            except Exception:
+                continue
+
+        cdn_data = await cdn_task
+
+        if commercial_info:
+            if cdn_data:
+                if commercial_info["title"] in ("Без названия", ""):
+                    commercial_info["title"] = cdn_data["title"]
+                if commercial_info["brand"] in ("Без бренда", ""):
+                    commercial_info["brand"] = cdn_data["brand"]
+                commercial_info["subj_name"] = cdn_data.get("subj_name", "")
+                commercial_info["history_min"] = cdn_data.get("min_hist_price", 0.0)
+                commercial_info["history_max"] = cdn_data.get("max_hist_price", 0.0)
+                commercial_info["history_avg"] = cdn_data.get("avg_hist_price", 0.0)
+                commercial_info["variants"] = cdn_data.get("variants", [])
+                if commercial_info["price"] <= 0 and cdn_data.get("latest_hist_price", 0) > 0:
+                    commercial_info["price"] = cdn_data["latest_hist_price"]
+            db.cache_product(
+                str(nm_id),
+                commercial_info["title"],
+                commercial_info["brand"],
+                commercial_info.get("subj_name", ""),
+                commercial_info["price"],
+            )
+            return True, commercial_info
+
+        if cdn_data:
+            return True, {
+                "id": str(nm_id),
+                "title": cdn_data["title"],
+                "brand": cdn_data["brand"],
+                "subj_name": cdn_data.get("subj_name", ""),
+                "price": cdn_data.get("latest_hist_price", 0.0),
+                "old_price": cdn_data.get("max_hist_price", 0.0),
+                "discount": 0,
+                "rating": 0.0,
+                "feedbacks": 0,
+                "qty": 0,
+                "history_min": cdn_data.get("min_hist_price", 0.0),
+                "history_max": cdn_data.get("max_hist_price", 0.0),
+                "history_avg": cdn_data.get("avg_hist_price", 0.0),
+                "variants": cdn_data.get("variants", []),
+                "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+            }
+
+        return False, {"error": "Товар с таким артикулом не найден в базе Wildberries."}
+
+    async def _discover_ids_via_web_index(self, query: str) -> List[str]:
+        """
+        Резервный поисковик артикулов WB через внешние поисковые индексы
+        на случай блокировки search.wb.ru для зарубежного IP-адреса Render.
+        """
+        session = await self.get_session()
+        q_encoded = quote(f"site:wildberries.ru/catalog/ {query.strip()}")
+        q_simple = quote(f"wildberries catalog detail {query.strip()}")
+
+        index_urls = [
+            f"https://html.duckduckgo.com/html/?q={q_encoded}",
+            f"https://lite.duckduckgo.com/lite/?q={q_encoded}",
+            f"https://search.yahoo.com/search?p={q_encoded}&n=20",
+            f"https://www.bing.com/search?q={q_simple}&count=20",
+        ]
+
+        found_ids: List[str] = []
+        id_regex = re.compile(r"wildberries\.ru/catalog/(\d{6,12})", re.IGNORECASE)
+
+        async def fetch_index(url: str) -> List[str]:
+            try:
+                async with session.get(url, headers=WB_HEADERS, timeout=6) as resp:
+                    if resp.status == 200:
+                        text = await resp.text(errors="ignore")
+                        return id_regex.findall(text)
+            except Exception:
+                pass
+            return []
+
+        results = await asyncio.gather(*(fetch_index(u) for u in index_urls))
+        for id_list in results:
+            for nm in id_list:
+                if nm not in found_ids:
+                    found_ids.append(nm)
+
+        return found_ids[:14]
+
+    async def search_lowest_prices(
+        self, query: str, mode: str = "smart"
+    ) -> Tuple[bool, List[Dict[str, Any]], str]:
+        """
+        4-уровневый гибридный поиск:
+        1. Прямой Search API Wildberries (v18 / v9 / v5)
+        2. Внешний веб-индекс + локальный кэш просмотренных товаров
+        3. Расширение выборки за счет связанных вариантов (colors) из CDN
+        4. Параллельная загрузка цен через незаблокированный CDN wbbasket.ru
+        """
+        session = await self.get_session()
+        proxy = self.proxy_url
+        encoded_q = quote(query.strip())
+        wb_sort = "popular" if mode == "smart" else "priceup"
+
+        search_urls = [
+            f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
+            f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
+            f"https://search.wb.ru/exactmatch/ru/common/v9/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
+            f"https://search.wb.ru/exactmatch/ru/common/v5/search?appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30",
+        ]
+
+        raw_products: List[Dict[str, Any]] = []
+        for url in search_urls:
+            try:
+                async with session.get(url, headers=WB_HEADERS, proxy=proxy, timeout=6) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        raw_products = self._extract_products(data)
+                        if raw_products:
+                            break
+            except Exception:
+                continue
+
+        if raw_products:
+            parsed = [self._parse_commercial_prod(p) for p in raw_products]
+            parsed = [p for p in parsed if p["price"] > 0]
+            if parsed:
+                if mode == "smart":
+                    good = [p for p in parsed if p["rating"] >= 4.4 and p["feedbacks"] >= 5]
+                    pool = good if len(good) >= 3 else parsed
+                    pool.sort(key=lambda x: x["price"])
+                    return True, pool[:8], "WB Search API"
+                parsed.sort(key=lambda x: x["price"])
+                return True, parsed[:8], "WB Search API"
+
+        # Уровень 2 и 3: Если Search API заблокировал зарубежный IP Render — включаем Web-Index + Кэш + CDN
+        candidate_ids = db.search_cached_nm_ids(query)
+        web_ids = await self._discover_ids_via_web_index(query)
+        for wid in web_ids:
+            if wid not in candidate_ids:
+                candidate_ids.append(wid)
+
+        if not candidate_ids:
+            return False, [], "none"
+
+        # Загружаем найденные артикулы через CDN wbbasket
+        initial_results = await asyncio.gather(
+            *(self.get_product_by_id(nm) for nm in candidate_ids[:12])
+        )
+        valid_items: List[Dict[str, Any]] = []
+        extra_variant_ids: List[str] = []
+
+        for ok, info in initial_results:
+            if ok and info.get("price", 0) > 0:
+                valid_items.append(info)
+                for v_id in info.get("variants", [])[:5]:
+                    if v_id not in candidate_ids and v_id not in extra_variant_ids:
+                        extra_variant_ids.append(v_id)
+
+        # Догружаем связанные артикулы (цвета/варианты), чтобы найти самую низкую цену в линейке
+        if len(valid_items) < 8 and extra_variant_ids:
+            var_results = await asyncio.gather(
+                *(self.get_product_by_id(nm) for nm in extra_variant_ids[:8])
+            )
+            for ok, info in var_results:
+                if ok and info.get("price", 0) > 0:
+                    valid_items.append(info)
+
+        if not valid_items:
+            return False, [], "none"
+
+        # Убираем дубликаты и сортируем по минимальной цене
+        unique_map = {item["id"]: item for item in valid_items}
+        sorted_items = sorted(unique_map.values(), key=lambda x: x["price"])
+        return True, sorted_items[:8], "Гибридный CDN-Индекс (обход IP)"
+
+
+wb_engine = WildberriesEngine()
 
 
 # ==========================================
-# 3. КЛАВИАТУРЫ
+# 3. АНАЛИТИКА И ФОРМАТИРОВАНИЕ СООБЩЕНИЙ
+# ==========================================
+def build_price_verdict(info: Dict[str, Any]) -> str:
+    curr = info.get("price", 0.0)
+    h_min = info.get("history_min", 0.0)
+    h_avg = info.get("history_avg", 0.0)
+
+    if curr <= 0 or h_min <= 0:
+        return ""
+    if curr <= h_min * 1.03:
+        return "🟢 <b>Вердикт: Идеальная цена (на уровне исторического минимума!)</b>\n"
+    if h_avg > 0 and curr <= h_avg:
+        diff_pct = round((1 - curr / h_avg) * 100)
+        return f"🟢 <b>Вердикт: Выгодно (на {diff_pct}% дешевле средней цены)</b>\n"
+    if h_avg > 0 and curr > h_avg * 1.10:
+        over_pct = round((curr / h_avg - 1) * 100)
+        return f"🔴 <b>Вердикт: Цена завышена (+{over_pct}% к средней истории)</b>\n"
+    return "🟡 <b>Вердикт: Обычная рыночная цена (можно подождать скидку)</b>\n"
+
+
+def format_product_card(info: Dict[str, Any], target_price: float = 0.0) -> str:
+    brand = html.escape(info["brand"])
+    title = html.escape(info["title"])
+
+    if info["price"] > 0:
+        price_str = f"{info['price']:,.0f}".replace(",", " ") + " ₽"
+    else:
+        price_str = "Нет в наличии (ожидается поставка)"
+
+    old_str = f"{info['old_price']:,.0f}".replace(",", " ")
+    discount_line = (
+        f" (<s>{old_str} ₽</s> • <b>-{info['discount']}%</b>)"
+        if info["discount"] > 0 and info["old_price"] > info["price"]
+        else ""
+    )
+
+    h_min = info.get("history_min", 0.0)
+    h_max = info.get("history_max", 0.0)
+    h_avg = info.get("history_avg", 0.0)
+
+    hist_lines = ""
+    if h_min > 0:
+        hm_str = f"{h_min:,.0f}".replace(",", " ")
+        hist_lines += f"📉 Мин. по истории WB: <b>{hm_str} ₽</b>"
+        if h_max > h_min:
+            hmax_str = f"{h_max:,.0f}".replace(",", " ")
+            hist_lines += f" | Макс: {hmax_str} ₽"
+        hist_lines += "\n"
+    if h_avg > 0:
+        havg_str = f"{h_avg:,.0f}".replace(",", " ")
+        hist_lines += f"📊 Средняя цена: <b>{havg_str} ₽</b>\n"
+
+    verdict_line = build_price_verdict(info)
+    target_line = (
+        f"🎯 Ваша цель: <b>≤ {int(target_price)} ₽</b>\n" if target_price > 0 else ""
+    )
+
+    variants_count = len(info.get("variants", []))
+    var_line = (
+        f"🎨 Связанных вариантов/цветов: <b>{variants_count} шт.</b> (нажмите кнопку ниже для поиска самого дешевого)\n"
+        if variants_count > 0
+        else ""
+    )
+
+    stock_str = (
+        f"🟢 В наличии ({info['qty']} шт.)"
+        if info["qty"] > 0
+        else "⚪ Остаток скрыт или на дальнем складе"
+    )
+    rating_line = (
+        f"⭐ Рейтинг: <b>{info['rating']}</b> ({info['feedbacks']} отз.)\n"
+        if info["rating"] > 0
+        else ""
+    )
+
+    return (
+        f"📦 <b>{brand}</b> — {title}\n\n"
+        f"💰 <b>Цена: {price_str}</b>{discount_line}\n"
+        f"{hist_lines}"
+        f"{verdict_line}"
+        f"{target_line}"
+        f"{rating_line}"
+        f"📊 Склад: {stock_str}\n"
+        f"{var_line}"
+        f"🏷️ Артикул: <code>{info['id']}</code>\n\n"
+        f"🔗 <a href='{info['url']}'>Открыть карточку на Wildberries</a>"
+    )
+
+
+def format_search_results(
+    query: str, items: List[Dict[str, Any]], mode: str, source_label: str
+) -> str:
+    safe_q = html.escape(query)
+    mode_title = (
+        "🔥 Выгодные предложения по возрастанию цены"
+        if mode == "smart"
+        else "📉 Абсолютный минимум цены"
+    )
+    lines = [
+        f"🔎 Запрос: <b>«{safe_q}»</b>\n"
+        f"<i>{mode_title} ({source_label}):</i>\n"
+    ]
+
+    for idx, item in enumerate(items, start=1):
+        brand = html.escape(item["brand"])
+        title = html.escape(item["title"])
+        price_str = f"{item['price']:,.0f}".replace(",", " ")
+        h_min = item.get("history_min", 0.0)
+        min_tag = f" (мин. был {int(h_min)}₽)" if h_min > 0 else ""
+        rating_tag = f" | ⭐ {item['rating']}" if item["rating"] > 0 else ""
+
+        lines.append(
+            f"<b>{idx}. {price_str} ₽</b>{min_tag}{rating_tag}\n"
+            f"   <b>{brand}</b> / {title}\n"
+            f"   Арт: <code>{item['id']}</code> • <a href='{item['url']}'>Открыть на WB</a>\n"
+        )
+
+    lines.append("💡 <i>Нажмите на кнопку с номером ниже, чтобы добавить товар в радар скидок!</i>")
+    return "\n".join(lines)
+
+
+# ==========================================
+# 4. КЛАВИАТУРЫ
 # ==========================================
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -498,29 +836,46 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="🔄 Проверить скидки сейчас"),
             ],
             [
-                KeyboardButton(text="🔍 Как искать товары?"),
+                KeyboardButton(text="💾 Бэкап и Прокси"),
                 KeyboardButton(text="⚙️ Статус бота"),
+            ],
+            [
+                KeyboardButton(text="🔍 Как пользоваться ботом?"),
             ],
         ],
         resize_keyboard=True,
     )
 
 
-def get_product_inline_kb(nm_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def get_product_inline_kb(info: Dict[str, Any]) -> InlineKeyboardMarkup:
+    nm_id = info["id"]
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="⭐ Отслеживать цену", callback_data=f"fav_add:{nm_id}"
+            ),
+            InlineKeyboardButton(
+                text="🎯 Задать цель ₽", callback_data=f"target_ask:{nm_id}"
+            ),
+        ]
+    ]
+    if info.get("variants"):
+        buttons.append(
             [
                 InlineKeyboardButton(
-                    text="⭐ Отслеживать снижение цены", callback_data=f"fav_add:{nm_id}"
+                    text=f"🎨 Сравнить цены всех вариантов ({len(info['variants'])} шт.)",
+                    callback_data=f"variants:{nm_id}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Обновить карточку", callback_data=f"refresh_id:{nm_id}"
-                )
-            ],
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🔄 Обновить карточку", callback_data=f"refresh_id:{nm_id}"
+            )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def get_search_results_kb(
@@ -528,7 +883,7 @@ def get_search_results_kb(
 ) -> InlineKeyboardMarkup:
     buttons = []
     row = []
-    for idx, item in enumerate(items[:5], start=1):
+    for idx, item in enumerate(items[:6], start=1):
         row.append(
             InlineKeyboardButton(
                 text=f"⭐ #{idx} ({int(item['price'])}₽)",
@@ -562,16 +917,23 @@ def get_search_results_kb(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_favorites_kb(items: List[Tuple[str, str, str, float, float]]) -> InlineKeyboardMarkup:
+def get_favorites_kb(
+    items: List[Tuple[str, str, str, float, float, float]]
+) -> InlineKeyboardMarkup:
     buttons = []
-    for nm_id, title, _, price, _ in items[:8]:
-        short_title = title[:18] + ".." if len(title) > 18 else title
+    for nm_id, title, _, price, _, target_p in items[:8]:
+        short_title = title[:16] + ".." if len(title) > 16 else title
+        t_badge = f" 🎯{int(target_p)}₽" if target_p > 0 else ""
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f"❌ Удалить {short_title} ({int(price)}₽)",
+                    text=f"🔎 {short_title} ({int(price)}₽{t_badge})",
+                    callback_data=f"open_id:{nm_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌",
                     callback_data=f"fav_del:{nm_id}",
-                )
+                ),
             ]
         )
     if len(items) > 1:
@@ -586,137 +948,142 @@ def get_favorites_kb(items: List[Tuple[str, str, str, float, float]]) -> InlineK
 
 
 # ==========================================
-# 4. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
+# 5. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
 # ==========================================
 router = Router()
 
 
-def format_product_card(info: Dict[str, Any]) -> str:
-    brand = html.escape(info["brand"])
-    title = html.escape(info["title"])
-
-    if info["price"] > 0:
-        price_str = f"{info['price']:,.0f}".replace(",", " ") + " ₽"
-    else:
-        price_str = "Нет в наличии (ожидается поставка)"
-
-    old_str = f"{info['old_price']:,.0f}".replace(",", " ")
-    discount_line = (
-        f" (<s>{old_str} ₽</s> • <b>-{info['discount']}%</b>)"
-        if info["discount"] > 0
-        else ""
-    )
-
-    hist_min = info.get("history_min", 0.0)
-    hist_line = ""
-    if hist_min > 0:
-        hm_str = f"{hist_min:,.0f}".replace(",", " ")
-        hist_line = f"📉 Мин. цена по истории WB: <b>{hm_str} ₽</b>\n"
-
-    stock_str = (
-        f"🟢 В наличии ({info['qty']} шт.)"
-        if info["qty"] > 0
-        else "⚪ Остаток скрыт или раскуплен"
-    )
-    rating_line = (
-        f"⭐ Рейтинг: <b>{info['rating']}</b> ({info['feedbacks']} отз.)\n"
-        if info["rating"] > 0
-        else ""
-    )
-
-    return (
-        f"📦 <b>{brand}</b> — {title}\n\n"
-        f"💰 <b>Цена: {price_str}</b>{discount_line}\n"
-        f"{hist_line}"
-        f"{rating_line}"
-        f"📊 Склад: {stock_str}\n"
-        f"🏷️ Артикул: <code>{info['id']}</code>\n\n"
-        f"🔗 <a href='{info['url']}'>Открыть карточку на Wildberries</a>"
-    )
-
-
-def format_search_results(
-    query: str, items: List[Dict[str, Any]], mode: str
-) -> str:
-    safe_q = html.escape(query)
-    mode_title = (
-        "🔥 Выгодные предложения (высокий рейтинг + низкая цена)"
-        if mode == "smart"
-        else "📉 Самые дешевые товары по возрастанию цены"
-    )
-    lines = [f"🔎 Запрос: <b>«{safe_q}»</b>\n<i>{mode_title}:</i>\n"]
-
-    for idx, item in enumerate(items, start=1):
-        brand = html.escape(item["brand"])
-        title = html.escape(item["title"])
-        price_str = f"{item['price']:,.0f}".replace(",", " ")
-        disc = f" (-{item['discount']}%)" if item["discount"] > 0 else ""
-        lines.append(
-            f"<b>{idx}. {price_str} ₽</b>{disc} | ⭐ {item['rating']} ({item['feedbacks']})\n"
-            f"   <b>{brand}</b> / {title}\n"
-            f"   Арт: <code>{item['id']}</code> • <a href='{item['url']}'>Открыть на WB</a>\n"
-        )
-
-    lines.append("💡 <i>Нажмите кнопку с номером товара ниже, чтобы отслеживать падение его цены!</i>")
-    return "\n".join(lines)
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    WAITING_TARGET_PRICE.pop(message.from_user.id, None)
     text = (
-        "🛍️ <b>Умный радар минимальных цен Wildberries (10/10)</b>\n\n"
-        "Напишите в чат, что вы ищете, в любом формате:\n"
-        "1️⃣ <b>Название товара</b> (например: <code>беспроводные наушники</code> или <code>кофе в зернах 1 кг</code>) — бот найдет самые низкие цены.\n"
-        "2️⃣ <b>Артикул или ссылку WB</b> (например: <code>14195461</code>) — бот покажет карточку, минимальную историческую цену и возьмет товар на мониторинг 24/7."
+        "🛍️ <b>WB Радар Цен — Версия «Абсолют»</b>\n\n"
+        "Отправьте в чат любой запрос:\n"
+        "1️⃣ <b>Артикул или ссылку WB</b> (например: <code>14195461</code>) — полная карточка, история цен, вердикт выгоды и сканер дешевых цветов/вариантов.\n"
+        "2️⃣ <b>Название товара</b> (например: <code>Раскраски для малышей</code>) — гибридный поиск самых низких цен.\n"
+        "3️⃣ <b>Артикул + желаемая цена</b> через пробел (например: <code>14195461 280</code>) — установка целевого алерта!"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
-@router.message(F.text == "🔍 Как искать товары?")
+@router.message(Command("restore"))
+async def cmd_restore(message: Message):
+    nms = re.findall(r"\d{5,12}", message.text or "")
+    if not nms:
+        await message.answer("❓ Пример восстановления: <code>/restore 14195461 183421364</code>", parse_mode="HTML")
+        return
+
+    wait_msg = await message.answer(f"⏳ Восстанавливаю {len(nms)} товаров из бэкапа...")
+    restored = 0
+    for nm_id in nms[:25]:
+        ok, info = await wb_engine.get_product_by_id(nm_id)
+        if ok:
+            db.save_item(
+                message.from_user.id,
+                nm_id,
+                info["title"],
+                info["brand"],
+                info["price"],
+                info.get("history_min", 0.0),
+            )
+            restored += 1
+
+    await wait_msg.delete()
+    await message.answer(
+        f"✅ Успешно восстановлено в избранное: <b>{restored} из {len(nms)}</b> товаров!",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@router.message(Command("proxy"))
+async def cmd_proxy(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or parts[1].strip().lower() in ("off", "clear", "none", "0"):
+        db.set_setting("proxy_url", "")
+        await message.answer("🌐 Прокси отключен. Используется прямой CDN + гибридный индекс.")
+        return
+
+    proxy_val = parts[1].strip()
+    if not proxy_val.startswith("http"):
+        proxy_val = "http://" + proxy_val
+    db.set_setting("proxy_url", proxy_val)
+    await message.answer(
+        f"✅ Прокси сохранен: <code>{html.escape(proxy_val)}</code>\n"
+        "Теперь прямые поисковые запросы к WB идут через него!",
+        parse_mode="HTML",
+    )
+
+
+@router.message(F.text == "🔍 Как пользоваться ботом?")
 async def cmd_help(message: Message):
     text = (
-        "💡 <b>Что умеет этот бот:</b>\n\n"
-        "• <b>Поиск по названию:</b> напишите название любого товара — бот отфильтрует лучшие предложения по самой низкой цене.\n"
-        "• <b>Проверка по артикулу/ссылке:</b> отправьте артикул или ссылку WB — бот проверит цену через API v4 и CDN-базу истории цен.\n"
-        "• <b>Авто-радар скидок 24/7:</b> добавьте товар в «⭐ Мое избранное», и бот сам пришлет уведомление при снижении цены!"
+        "💡 <b>Возможности версии «Абсолют»:</b>\n\n"
+        "• <b>Полный рентген артикула:</b> пришлите артикул или ссылку WB — увидите текущую цену, минимум/максимум и среднюю цену по истории WB.\n"
+        "• <b>🎨 Варианты дешевле:</b> кнопка под карточкой проверяет все соседние цвета и вариации этого товара у продавца и находит самый дешевый.\n"
+        "• <b>🎯 Целевая цена:</b> задайте порог в рублях, и бот пришлет уведомление, когда цена пробьет вашу отметку.\n"
+        "• <b>💾 Бэкап в 1 клик:</b> сохраняйте список артикулов, чтобы не терять их при перезапуске бесплатного контейнера Render."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+
+@router.message(F.text == "💾 Бэкап и Прокси")
+async def cmd_backup_and_proxy(message: Message):
+    items = db.get_user_items(message.from_user.id)
+    if items:
+        ids_str = " ".join(nm_id for nm_id, *_ in items)
+        restore_cmd = f"<code>/restore {ids_str}</code>"
+    else:
+        restore_cmd = "<i>Список избранного пока пуст</i>"
+
+    curr_proxy = wb_engine.proxy_url or "Не задан (работает гибридный CDN-обход)"
+    text = (
+        "💾 <b>Резервная копия ваших товаров:</b>\n"
+        "Скопируйте команду ниже — после любого обновления на Render просто отправьте её в чат для мгновенного восстановления базы:\n"
+        f"{restore_cmd}\n\n"
+        "🌐 <b>Настройка российского IPv4 прокси (по желанию):</b>\n"
+        f"• Текущий статус: <code>{html.escape(curr_proxy)}</code>\n"
+        "• Подключить: <code>/proxy http://login:pass@ip:port</code>\n"
+        "• Отключить: <code>/proxy off</code>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
 @router.message(F.text == "⚙️ Статус бота")
 async def cmd_status(message: Message):
-    items = get_user_items(message.from_user.id)
-    proxy_status = "Активен" if PROXY_URL else "Прямой CDN + API v4 обход"
+    items = db.get_user_items(message.from_user.id)
+    proxy_status = "Прокси активен" if wb_engine.proxy_url else "Гибридный CDN + Web-Index"
     text = (
-        "⚙️ <b>Статус системы:</b>\n\n"
-        f"📂 База данных: <b>Активна ({DB_PATH.name})</b>\n"
-        f"⭐ Товаров у вас на мониторинге: <b>{len(items)} шт.</b>\n"
-        "🌐 Движок: <b>WB API v4 + CDN wbbasket + PriceHistory</b>\n"
+        "⚙️ <b>Статус системы (Абсолют):</b>\n\n"
+        f"📂 База данных: <b>SQLite WAL ({DB_PATH.name})</b>\n"
+        f"⭐ Товаров на мониторинге: <b>{len(items)} шт.</b>\n"
+        "🌐 Ядро: <b>WB API v4 + CDN wbbasket + Сканер вариаций</b>\n"
         f"🛡️ Сетевой режим: <b>{proxy_status}</b>\n"
-        "🔔 Авто-проверка скидок: <b>Каждые 30 минут (24/7)</b>"
+        "🔔 Фоновый радар скидок: <b>Каждые 30 минут (24/7)</b>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
 @router.message(F.text == "⭐ Мое избранное")
 async def show_favorites(message: Message):
-    items = get_user_items(message.from_user.id)
+    items = db.get_user_items(message.from_user.id)
     if not items:
         await message.answer(
-            "📭 Ваш список отслеживания пуст.\nНапишите название товара или пришлите артикул, чтобы добавить позиции!",
+            "📭 Ваш список отслеживания пуст.\nПришлите артикул или название товара, чтобы добавить позиции!",
             reply_markup=get_main_keyboard(),
         )
         return
 
     lines = [f"⭐ <b>Ваши отслеживаемые товары ({len(items)} шт.):</b>\n"]
-    for nm_id, title, brand, last_price, min_price in items:
+    for nm_id, title, brand, last_price, min_price, target_p in items:
         b_safe = html.escape(brand)
         t_safe = html.escape(title)
         lp_str = f"{last_price:,.0f}".replace(",", " ") if last_price > 0 else "н/д"
         mp_str = f"{min_price:,.0f}".replace(",", " ") if min_price > 0 else "н/д"
+        target_str = f" | 🎯 Цель: <b>≤ {int(target_p)} ₽</b>" if target_p > 0 else ""
         lines.append(
             f"🔹 <b>{b_safe}</b> — {t_safe}\n"
-            f"   Арт: <code>{nm_id}</code> | Цена: <b>{lp_str} ₽</b> (Мин: {mp_str} ₽)\n"
+            f"   Арт: <code>{nm_id}</code> | Цена: <b>{lp_str} ₽</b> (Мин: {mp_str} ₽){target_str}\n"
             f"   🔗 <a href='https://www.wildberries.ru/catalog/{nm_id}/detail.aspx'>Открыть на WB</a>\n"
         )
 
@@ -730,7 +1097,7 @@ async def show_favorites(message: Message):
 
 @router.message(F.text == "🔄 Проверить скидки сейчас")
 async def manual_check_discounts(message: Message):
-    items = get_user_items(message.from_user.id)
+    items = db.get_user_items(message.from_user.id)
     if not items:
         await message.answer(
             "📭 Сначала добавьте товары в «⭐ Мое избранное».",
@@ -738,39 +1105,39 @@ async def manual_check_discounts(message: Message):
         )
         return
 
-    wait_msg = await message.answer(
-        f"⏳ Сверяю актуальные цены для {len(items)} товаров..."
-    )
+    wait_msg = await message.answer(f"⏳ Сверяю актуальные цены для {len(items)} товаров...")
+    report = ["📊 <b>Отчет по ценам избранного:</b>\n"]
 
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-    report = ["📊 <b>Результат проверки цен:</b>\n"]
+    for nm_id, title, _, old_saved_price, _, target_p in items:
+        ok, info = await wb_engine.get_product_by_id(nm_id)
+        t_safe = html.escape(title[:35])
+        if not ok or info["price"] <= 0:
+            report.append(f"⚪ <code>{nm_id}</code> ({t_safe}) — нет в наличии")
+            continue
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for nm_id, title, _, old_saved_price, _ in items:
-            ok, info = await get_wb_product_by_id(session, nm_id)
-            t_safe = html.escape(title[:35])
-            if not ok or info["price"] <= 0:
-                report.append(f"⚪ <code>{nm_id}</code> ({t_safe}) — нет в наличии")
-                continue
+        new_price = info["price"]
+        db.update_price(message.from_user.id, nm_id, new_price)
+        diff = new_price - old_saved_price if old_saved_price > 0 else 0
+        target_hit = (
+            f"\n   🎯 <b>ДОСТИГНУТА ВАША ЦЕЛЬ ({int(target_p)} ₽)!</b>"
+            if (target_p > 0 and new_price <= target_p)
+            else ""
+        )
 
-            new_price = info["price"]
-            update_item_price_in_db(message.from_user.id, nm_id, new_price)
-            diff = new_price - old_saved_price if old_saved_price > 0 else 0
-
-            if diff < -1:
-                report.append(
-                    f"🔥 <b>ПОДЕШЕВЕЛ на {abs(int(diff))} ₽!</b>\n"
-                    f"   {t_safe}: было {int(old_saved_price)} ₽ ➡️ <b>стало {int(new_price)} ₽</b>\n"
-                    f"   🔗 <a href='{info['url']}'>Забрать на WB</a>"
-                )
-            elif diff > 1:
-                report.append(
-                    f"📈 {t_safe}: +{int(diff)} ₽ (сейчас <b>{int(new_price)} ₽</b>)"
-                )
-            else:
-                report.append(
-                    f"🟰 {t_safe}: без изменений (<b>{int(new_price)} ₽</b>)"
-                )
+        if diff < -1:
+            report.append(
+                f"🔥 <b>ПОДЕШЕВЕЛ на {abs(int(diff))} ₽!</b>\n"
+                f"   {t_safe}: было {int(old_saved_price)} ₽ ➡️ <b>стало {int(new_price)} ₽</b>{target_hit}\n"
+                f"   🔗 <a href='{info['url']}'>Забрать на WB</a>"
+            )
+        elif diff > 1:
+            report.append(
+                f"📈 {t_safe}: +{int(diff)} ₽ (сейчас <b>{int(new_price)} ₽</b>){target_hit}"
+            )
+        else:
+            report.append(
+                f"🟰 {t_safe}: без изменений (<b>{int(new_price)} ₽</b> | мин. по истории: {int(info.get('history_min', 0))} ₽){target_hit}"
+            )
 
     await wait_msg.delete()
     await message.answer(
@@ -784,42 +1151,115 @@ async def manual_check_discounts(message: Message):
 @router.callback_query(F.data.startswith("fav_add:"))
 async def cb_add_favorite(callback: CallbackQuery):
     nm_id = callback.data.split(":")[1]
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ok, info = await get_wb_product_by_id(session, nm_id)
+    ok, info = await wb_engine.get_product_by_id(nm_id)
 
     if ok:
-        save_tracked_item(
+        db.save_item(
             callback.from_user.id,
             nm_id,
             info["title"],
             info["brand"],
             info["price"],
+            info.get("history_min", 0.0),
         )
-        p_label = f"{int(info['price'])} ₽" if info["price"] > 0 else "мониторинг наличия"
-        await callback.answer(f"✅ Сохранено в избранное ({p_label})!", show_alert=False)
+        p_label = f"{int(info['price'])} ₽" if info["price"] > 0 else "мониторинг"
+        await callback.answer(f"✅ Добавлено в избранное ({p_label})!", show_alert=False)
     else:
-        await callback.answer("⚠️ Не удалось получить карточку товара.", show_alert=True)
+        await callback.answer("⚠️ Не удалось загрузить карточку.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("target_ask:"))
+async def cb_ask_target_price(callback: CallbackQuery):
+    nm_id = callback.data.split(":")[1]
+    ok, info = await wb_engine.get_product_by_id(nm_id)
+    if ok:
+        db.save_item(
+            callback.from_user.id,
+            nm_id,
+            info["title"],
+            info["brand"],
+            info["price"],
+            info.get("history_min", 0.0),
+        )
+
+    WAITING_TARGET_PRICE[callback.from_user.id] = nm_id
+    await callback.answer()
+    await callback.message.answer(
+        f"🎯 Введите желаемую цену в рублях для артикула <code>{nm_id}</code> (например: <code>280</code>):\n"
+        "<i>Как только цена опустится до этого значения или ниже, бот пришлет вам уведомление!</i>",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("variants:"))
+async def cb_check_variants(callback: CallbackQuery):
+    nm_id = callback.data.split(":")[1]
+    await callback.answer("Сканирую цены всех вариантов в линейке...")
+
+    ok, base_info = await wb_engine.get_product_by_id(nm_id)
+    if not ok or not base_info.get("variants"):
+        await callback.message.answer("У этого товара нет других связанных вариантов.")
+        return
+
+    all_ids = [nm_id] + base_info["variants"][:10]
+    results = await asyncio.gather(*(wb_engine.get_product_by_id(v) for v in all_ids))
+
+    valid_variants = [info for ok_v, info in results if ok_v and info.get("price", 0) > 0]
+    if not valid_variants:
+        await callback.message.answer("Не удалось получить цены связанных вариантов.")
+        return
+
+    valid_variants.sort(key=lambda x: x["price"])
+    lines = [
+        f"🎨 <b>Сравнение цен всех вариантов линейки ({len(valid_variants)} шт.):</b>\n"
+    ]
+    for idx, v in enumerate(valid_variants, start=1):
+        current_mark = " 👈 <i>(текущий)</i>" if v["id"] == nm_id else ""
+        h_min = v.get("history_min", 0)
+        min_str = f" | мин. был {int(h_min)}₽" if h_min > 0 else ""
+        lines.append(
+            f"<b>{idx}. {int(v['price'])} ₽</b>{min_str}{current_mark}\n"
+            f"   {html.escape(v['title'])}\n"
+            f"   Арт: <code>{v['id']}</code> • <a href='{v['url']}'>Открыть на WB</a>\n"
+        )
+
+    await callback.message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=get_search_results_kb(valid_variants, current_mode="smart"),
+    )
+
+
+@router.callback_query(F.data.startswith("open_id:"))
+async def cb_open_id(callback: CallbackQuery):
+    nm_id = callback.data.split(":")[1]
+    await callback.answer("Загружаю карточку...")
+    ok, info = await wb_engine.get_product_by_id(nm_id)
+    if ok:
+        await callback.message.answer(
+            format_product_card(info),
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+            reply_markup=get_product_inline_kb(info),
+        )
 
 
 @router.callback_query(F.data.startswith("refresh_id:"))
 async def cb_refresh_card(callback: CallbackQuery):
     nm_id = callback.data.split(":")[1]
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ok, info = await get_wb_product_by_id(session, nm_id)
-
+    ok, info = await wb_engine.get_product_by_id(nm_id)
     if not ok:
         await callback.answer("Товар временно недоступен", show_alert=True)
         return
 
-    await callback.answer("Карточка обновлена!")
+    await callback.answer("Данные обновлены!")
     try:
         await callback.message.edit_text(
             format_product_card(info),
             parse_mode="HTML",
             disable_web_page_preview=False,
-            reply_markup=get_product_inline_kb(nm_id),
+            reply_markup=get_product_inline_kb(info),
         )
     except Exception:
         pass
@@ -836,17 +1276,14 @@ async def cb_switch_search_mode(callback: CallbackQuery):
         return
 
     await callback.answer("Пересчитываю выдачу...")
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ok, items = await search_wb_lowest_prices(session, query, mode=mode)
-
+    ok, items, source_label = await wb_engine.search_lowest_prices(query, mode=mode)
     if not ok or not items:
         await callback.answer("По этому фильтру ничего не найдено.", show_alert=True)
         return
 
     try:
         await callback.message.edit_text(
-            format_search_results(query, items, mode),
+            format_search_results(query, items, mode, source_label),
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=get_search_results_kb(items, mode),
@@ -859,10 +1296,10 @@ async def cb_switch_search_mode(callback: CallbackQuery):
 async def cb_delete_favorite(callback: CallbackQuery):
     nm_id = callback.data.split(":")[1]
     user_id = callback.from_user.id
-    delete_tracked_item(user_id, nm_id)
-    await callback.answer("Товар удален из отслеживания")
+    db.delete_item(user_id, nm_id)
+    await callback.answer("Товар удален")
 
-    items = get_user_items(user_id)
+    items = db.get_user_items(user_id)
     if not items:
         await callback.message.edit_text("📭 Ваш список отслеживания пуст.")
     else:
@@ -871,7 +1308,7 @@ async def cb_delete_favorite(callback: CallbackQuery):
 
 @router.callback_query(F.data == "fav_clear_all")
 async def cb_clear_favorites(callback: CallbackQuery):
-    clear_user_items(callback.from_user.id)
+    db.clear_user_items(callback.from_user.id)
     await callback.answer("Список очищен!")
     await callback.message.edit_text("📭 Ваш список отслеживания пуст.")
 
@@ -879,7 +1316,47 @@ async def cb_clear_favorites(callback: CallbackQuery):
 @router.message(F.text)
 async def handle_user_input(message: Message):
     text = message.text.strip()
+    user_id = message.from_user.id
 
+    # 1. Проверяем, вводит ли пользователь целевую цену после нажатия кнопки «🎯 Задать цель ₽»
+    if user_id in WAITING_TARGET_PRICE and re.fullmatch(r"\d{1,7}([.,]\d{1,2})?", text):
+        nm_id = WAITING_TARGET_PRICE.pop(user_id)
+        target_val = float(text.replace(",", "."))
+        db.set_target_price(user_id, nm_id, target_val)
+        await message.answer(
+            f"🎯 Цель <b>≤ {int(target_val)} ₽</b> для артикула <code>{nm_id}</code> сохранена!\n"
+            "Бот автоматически уведомит вас при достижении этой цены.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    WAITING_TARGET_PRICE.pop(user_id, None)
+
+    # 2. Проверяем формат «Артикул ЦелеваяЦена» (например: 14195461 280)
+    combo_match = re.fullmatch(r"(\d{6,12})\s+(\d{2,7})", text)
+    if combo_match:
+        nm_id, target_str = combo_match.group(1), combo_match.group(2)
+        target_val = float(target_str)
+        ok, info = await wb_engine.get_product_by_id(nm_id)
+        if ok:
+            db.save_item(
+                user_id,
+                nm_id,
+                info["title"],
+                info["brand"],
+                info["price"],
+                info.get("history_min", 0.0),
+                target_price=target_val,
+            )
+            await message.answer(
+                format_product_card(info, target_price=target_val),
+                parse_mode="HTML",
+                reply_markup=get_product_inline_kb(info),
+            )
+            return
+
+    # 3. Проверяем ссылку WB или чистый артикул
     url_match = re.search(r"wildberries\.[a-z]+/catalog/(\d{5,12})", text, re.IGNORECASE)
     pure_digits_match = re.fullmatch(r"\d{5,12}", text)
 
@@ -889,17 +1366,13 @@ async def handle_user_input(message: Message):
     elif pure_digits_match:
         nm_id = pure_digits_match.group(0)
 
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-
-    # Сценарий А: Поиск конкретного товара по артикулу или ссылке
     if nm_id:
         wait_msg = await message.answer(
-            f"⏳ Загружаю карточку артикула <code>{nm_id}</code>...", parse_mode="HTML"
+            f"⏳ Загружаю аналитику по артикулу <code>{nm_id}</code>...", parse_mode="HTML"
         )
-        async with aiohttp.ClientSession(connector=connector) as session:
-            ok, info = await get_wb_product_by_id(session, nm_id)
-
+        ok, info = await wb_engine.get_product_by_id(nm_id)
         await wait_msg.delete()
+
         if not ok:
             await message.answer(
                 f"❌ {info.get('error', 'Товар не найден.')}",
@@ -911,11 +1384,11 @@ async def handle_user_input(message: Message):
             format_product_card(info),
             parse_mode="HTML",
             disable_web_page_preview=False,
-            reply_markup=get_product_inline_kb(nm_id),
+            reply_markup=get_product_inline_kb(info),
         )
         return
 
-    # Сценарий Б: Поиск самых низких цен по названию товара
+    # 4. Поиск самых низких цен по названию товара
     if len(text) < 2:
         await message.answer(
             "❓ Напишите название товара (от 2 букв) или пришлите артикул WB.",
@@ -923,28 +1396,28 @@ async def handle_user_input(message: Message):
         )
         return
 
-    LAST_SEARCH_QUERY[message.from_user.id] = text
+    LAST_SEARCH_QUERY[user_id] = text
     wait_msg = await message.answer(
         f"🔎 Ищу самые выгодные цены по запросу <b>«{html.escape(text)}»</b>...",
         parse_mode="HTML",
     )
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ok, items = await search_wb_lowest_prices(session, text, mode="smart")
-
+    ok, items, source_label = await wb_engine.search_lowest_prices(text, mode="smart")
     await wait_msg.delete()
 
     if not ok or not items:
         await message.answer(
-            "😕 По текстовому запросу сервер WB не вернул список (возможна защита от зарубежного IP хостинга Render).\n\n"
-            "💡 Пришлите <b>артикул товара</b> или <b>ссылку из приложения WB</b> — прямой поиск по артикулу через CDN работает без ограничений!",
+            "😕 По текстовому запросу не удалось получить список с зарубежного IP.\n\n"
+            "💡 <b>2 быстрых решения:</b>\n"
+            "1. Пришлите <b>один любой артикул</b> нужной категории из приложения WB и нажмите кнопку <b>«🎨 Сравнить цены всех вариантов»</b> — бот мгновенно вытащит всю линейку через CDN!\n"
+            "2. Или подключите любой российский прокси командой <code>/proxy http://user:pass@ip:port</code>.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
         return
 
     await message.answer(
-        format_search_results(text, items, mode="smart"),
+        format_search_results(text, items, mode="smart", source_label=source_label),
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=get_search_results_kb(items, current_mode="smart"),
@@ -952,42 +1425,48 @@ async def handle_user_input(message: Message):
 
 
 # ==========================================
-# 5. ФОНОВЫЙ РАДАР СКИДОК + СЕРВЕР RENDER
+# 6. ФОНОВЫЙ РАДАР СКИДОК + СЕРВЕР RENDER
 # ==========================================
 async def background_price_watcher(bot: Bot):
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
     while True:
-        await asyncio.sleep(1800)
-        all_items = get_all_tracked_items()
+        await asyncio.sleep(1800)  # 30 минут
+        all_items = db.get_all_items()
         if not all_items:
             continue
 
         logger.info(f"Фоновая проверка цен для {len(all_items)} позиций...")
-        async with aiohttp.ClientSession(connector=connector) as session:
-            for user_id, nm_id, title, brand, last_price in all_items:
-                ok, info = await get_wb_product_by_id(session, nm_id)
-                if not ok or info["price"] <= 0:
-                    continue
+        for user_id, nm_id, title, brand, last_price, target_p in all_items:
+            ok, info = await wb_engine.get_product_by_id(nm_id)
+            if not ok or info["price"] <= 0:
+                continue
 
-                new_price = info["price"]
-                if last_price > 0 and new_price < last_price - 5:
-                    drop = int(last_price - new_price)
-                    update_item_price_in_db(user_id, nm_id, new_price)
-                    alert_text = (
-                        f"🔥 <b>ЦЕНА СНИЗИЛАСЬ НА {drop} ₽!</b>\n\n"
-                        f"📦 <b>{html.escape(brand)}</b> — {html.escape(title)}\n"
-                        f"📉 Было: <s>{int(last_price)} ₽</s> ➡️ <b>Стало: {int(new_price)} ₽</b>\n"
-                        f"🏷️ Артикул: <code>{nm_id}</code>\n\n"
-                        f"🔗 <a href='{info['url']}'>Успеть купить на Wildberries</a>"
-                    )
-                    try:
-                        await bot.send_message(user_id, alert_text, parse_mode="HTML")
-                    except Exception as e:
-                        logger.warning(f"Не удалось отправить алерт {user_id}: {e}")
-                elif new_price != last_price:
-                    update_item_price_in_db(user_id, nm_id, new_price)
+            new_price = info["price"]
+            target_reached = target_p > 0 and new_price <= target_p and (last_price > target_p or last_price == 0)
+            price_dropped = last_price > 0 and new_price < last_price - 5
 
-                await asyncio.sleep(1.5)
+            if target_reached or price_dropped:
+                drop = int(last_price - new_price) if last_price > new_price else 0
+                db.update_price(user_id, nm_id, new_price)
+                header = (
+                    f"🎯 <b>ДОСТИГНУТА ВАША ЦЕЛЕВАЯ ЦЕНА ({int(target_p)} ₽)!</b>"
+                    if target_reached
+                    else f"🔥 <b>ЦЕНА СНИЗИЛАСЬ НА {drop} ₽!</b>"
+                )
+                alert_text = (
+                    f"{header}\n\n"
+                    f"📦 <b>{html.escape(brand)}</b> — {html.escape(title)}\n"
+                    f"📉 Было: <s>{int(last_price)} ₽</s> ➡️ <b>Стало: {int(new_price)} ₽</b>\n"
+                    f"🏷️ Артикул: <code>{nm_id}</code>\n\n"
+                    f"🔗 <a href='{info['url']}'>Успеть купить на Wildberries</a>"
+                )
+                try:
+                    await bot.send_message(user_id, alert_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить алерт {user_id}: {e}")
+            elif new_price != last_price:
+                db.update_price(user_id, nm_id, new_price)
+
+            await asyncio.sleep(1.5)
 
 
 async def keep_alive_ping():
@@ -995,20 +1474,19 @@ async def keep_alive_ping():
     if not external_url:
         return
     ping_url = f"{external_url.rstrip('/')}/health"
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
-            await asyncio.sleep(600)
-            try:
-                async with session.get(ping_url, timeout=10) as resp:
-                    logger.info(f"Keep-alive ping: HTTP {resp.status}")
-            except Exception as e:
-                logger.warning(f"Keep-alive ping error: {e}")
+    while True:
+        await asyncio.sleep(600)
+        try:
+            session = await wb_engine.get_session()
+            async with session.get(ping_url, timeout=10) as resp:
+                logger.info(f"Keep-alive ping: HTTP {resp.status}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping error: {e}")
 
 
 async def start_render_web_server():
     app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="WB Radar Bot 10/10 is live!"))
+    app.router.add_get("/", lambda request: web.Response(text="WB Radar Bot Absolute is live!"))
     app.router.add_get("/health", lambda request: web.Response(text="OK"))
 
     runner = web.AppRunner(app)
@@ -1019,21 +1497,30 @@ async def start_render_web_server():
     logger.info(f"Веб-сервер для Render запущен на порту {port}")
 
 
+async def on_shutdown() -> None:
+    logger.info("Остановка бота, закрываю сетевые соединения...")
+    await wb_engine.close()
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не найден токен Telegram-бота в переменных окружения (BOT_TOKEN)!")
 
-    init_db()
+    # 1. Сначала поднимаем HTTP-сервер, чтобы Render увидел статус 200 OK и погасил старый контейнер
     await start_render_web_server()
+
+    # 2. Выдерживаем паузу 4 секунды перед стартом поллинга для исключения TelegramConflictError при пересборке
+    await asyncio.sleep(4)
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    dp.shutdown.register(on_shutdown)
 
     asyncio.create_task(keep_alive_ping())
     asyncio.create_task(background_price_watcher(bot))
 
-    logger.info("WB Радар цен (v4 + CDN) успешно запущен!")
+    logger.info("WB Радар цен (Версия Абсолют) успешно запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
