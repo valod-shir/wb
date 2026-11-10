@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -7,6 +8,7 @@ import random
 import re
 import socket
 import sqlite3
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import quote, unquote
@@ -35,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("wb_enterprise")
+logger = logging.getLogger("wb_enterprise_v6")
 
 
 def resolve_bot_token() -> str:
@@ -59,11 +61,29 @@ BOT_TOKEN = resolve_bot_token()
 DB_PATH = BASE_DIR / "wb_tracker.db"
 
 USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
 ]
+
+# Локальный словарь частых опечаток для мгновенной коррекции до сетевого запроса
+LOCAL_TYPO_FIXES = {
+    "комбенизон": "комбинезон",
+    "комбинизон": "комбинезон",
+    "камбинезон": "комбинезон",
+    "красовки": "кроссовки",
+    "крассовки": "кроссовки",
+    "кросовки": "кроссовки",
+    "фудболка": "футболка",
+    "толстовка": "толстовка",
+    "расскраски": "раскраски",
+    "раскрасски": "раскраски",
+    "наушникии": "наушники",
+    "аккамулятор": "аккумулятор",
+    "акумулятор": "аккумулятор",
+    "пылисос": "пылесос",
+}
 
 LAST_SEARCH_QUERY: Dict[int, str] = {}
 WAITING_TARGET_PRICE: Dict[int, str] = {}
@@ -195,21 +215,22 @@ class DatabaseManager:
         words = [w.lower() for w in re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]{3,}", query)]
         if not words:
             return []
+        stems = [w[:5] if len(w) >= 6 else w[:4] for w in words]
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT nm_id, title, brand, subj_name FROM catalog_cache ORDER BY updated_at DESC LIMIT 500"
+                "SELECT nm_id, title, brand, subj_name FROM catalog_cache ORDER BY updated_at DESC LIMIT 800"
             ).fetchall()
 
         exact_matches: List[str] = []
-        partial_matches: List[str] = []
+        stem_matches: List[str] = []
         for nm_id, title, brand, subj in rows:
             haystack = f"{title} {brand} {subj}".lower()
             if all(w in haystack for w in words):
                 exact_matches.append(nm_id)
-            elif any(w[:4] in haystack for w in words if len(w) >= 4):
-                partial_matches.append(nm_id)
+            elif all(st in haystack for st in stems if len(st) >= 3):
+                stem_matches.append(nm_id)
 
-        combined = exact_matches + [m for m in partial_matches if m not in exact_matches]
+        combined = exact_matches + [m for m in stem_matches if m not in exact_matches]
         return combined[:15]
 
     def save_item(
@@ -225,7 +246,7 @@ class DatabaseManager:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT min_seen_price, target_price FROM tracked_items WHERE user_id = ? AND nm_id = ?",
-                (user_id, nm_id),
+                (user_id, str(nm_id)),
             ).fetchone()
 
             candidates = [
@@ -320,15 +341,12 @@ db = DatabaseManager(DB_PATH)
 # 2. МЕНЕДЖЕР ПРОКСИ И СЕТЕВОЙ УСТОЙЧИВОСТИ
 # ==========================================
 class ProxyManager:
-    """Автоматически распознает форматы ip:port:user:pass, user:pass@ip:port и пулы прокси."""
-
     @staticmethod
     def normalize_proxy(raw: str) -> Optional[str]:
         clean = raw.strip()
         if not clean or clean.lower() in ("off", "none", "clear", "0"):
             return None
 
-        # Формат ip:port:login:password (популярен у российских провайдеров прокси)
         parts = clean.split(":")
         if len(parts) == 4 and not clean.startswith("http"):
             ip, port, user, pw = parts
@@ -363,22 +381,23 @@ class ProxyManager:
 
 
 # ==========================================
-# 3. ENTERPRISE-ЯДРО WILDBERRIES (5-УРОВНЕВЫЙ КАСКАД)
+# 3. ENTERPRISE-ЯДРО WILDBERRIES (6-УРОВНЕВЫЙ КАСКАД)
 # ==========================================
 class WildberriesEnterpriseEngine:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self.cdn_semaphore = asyncio.Semaphore(10)
+        self.cdn_semaphore = asyncio.Semaphore(12)
+        self.menu_categories: List[Dict[str, str]] = []
 
     async def get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(
                 family=socket.AF_INET,
                 ssl=False,
-                limit=50,
+                limit=60,
                 ttl_dns_cache=600,
             )
-            timeout = aiohttp.ClientTimeout(total=14, connect=5)
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
             self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self.session
 
@@ -396,22 +415,32 @@ class WildberriesEnterpriseEngine:
             (3701, "21"), (3917, "22"), (4133, "23"), (4349, "24"), (4565, "25"),
             (4877, "26"), (5189, "27"), (5501, "28"), (5813, "29"), (6125, "30"),
             (6437, "31"), (6749, "32"), (7061, "33"), (7373, "34"), (7685, "35"),
-            (7997, "36"), (8309, "37"), (8621, "38"),
+            (7997, "36"), (8309, "37"), (8621, "38"), (8933, "39"), (9245, "40"),
         ]
         for max_vol, b_num in ranges:
             if vol <= max_vol:
                 return b_num
-        return "39"
+        return "41"
 
     async def autocorrect_typo(self, query: str) -> str:
-        """Исправляет опечатки через глобальный сервис Yandex Speller (например: 'Комбенизон' -> 'Комбинезон')."""
+        """Двухэтапное исправление опечаток: локальный словарь + Yandex Speller API."""
+        words = query.strip().split()
+        fixed_words = []
+        for w in words:
+            w_low = w.lower()
+            if w_low in LOCAL_TYPO_FIXES:
+                fixed_words.append(LOCAL_TYPO_FIXES[w_low])
+            else:
+                fixed_words.append(w)
+        pre_fixed = " ".join(fixed_words)
+
         session = await self.get_session()
-        url = f"https://speller.yandex.net/services/spellservice.json/checkText?text={quote(query)}&lang=ru,en"
+        url = f"https://speller.yandex.net/services/spellservice.json/checkText?text={quote(pre_fixed)}&lang=ru,en"
         try:
-            async with session.get(url, timeout=3.5) as resp:
+            async with session.get(url, timeout=3.0) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    corrected = query
+                    corrected = pre_fixed
                     for item in data:
                         word = item.get("word")
                         suggestions = item.get("s")
@@ -420,7 +449,7 @@ class WildberriesEnterpriseEngine:
                     return corrected.strip()
         except Exception as e:
             logger.debug(f"Speller check skipped: {e}")
-        return query
+        return pre_fixed
 
     @staticmethod
     def _extract_products(data: Any) -> List[Dict[str, Any]]:
@@ -441,6 +470,7 @@ class WildberriesEnterpriseEngine:
     @staticmethod
     def _parse_commercial_prod(prod: Dict[str, Any]) -> Dict[str, Any]:
         nm_id = str(prod.get("id") or prod.get("nm_id") or "")
+        imt_id = str(prod.get("root") or prod.get("imt_id") or "")
         title = str(prod.get("name") or prod.get("imt_name") or "Без названия").strip()
         brand = str(prod.get("brand") or "Без бренда").strip() or "Без бренда"
         subj_name = str(prod.get("entity") or prod.get("subj_name") or "").strip()
@@ -486,6 +516,7 @@ class WildberriesEnterpriseEngine:
 
         return {
             "id": nm_id,
+            "imt_id": imt_id,
             "title": title,
             "brand": brand,
             "subj_name": subj_name,
@@ -502,8 +533,30 @@ class WildberriesEnterpriseEngine:
             "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
         }
 
+    async def fetch_feedbacks_rating(self, imt_id: str) -> Tuple[float, int]:
+        """Запрашивает живой рейтинг и число отзывов с незаблокированного кластера feedbacks1/2.wb.ru."""
+        if not imt_id or not str(imt_id).isdigit():
+            return 0.0, 0
+        session = await self.get_session()
+        for host in ("https://feedbacks1.wb.ru", "https://feedbacks2.wb.ru"):
+            url = f"{host}/feedbacks/v1/{imt_id}"
+            try:
+                async with session.get(
+                    url, headers=get_spoofed_headers(), timeout=3.0
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        if isinstance(data, dict):
+                            val = float(data.get("valuation") or 0.0)
+                            cnt = int(data.get("feedbackCount") or 0)
+                            if val > 0 or cnt > 0:
+                                return val, cnt
+            except Exception:
+                continue
+        return 0.0, 0
+
     async def fetch_cdn_basket(self, nm_id: str) -> Dict[str, Any]:
-        """Загружает статическую карточку card.json и историю цен с глобального CDN wbbasket.ru."""
+        """Загружает карточку card.json и историю цен с глобального CDN wbbasket.ru."""
         try:
             nm_int = int(nm_id)
         except ValueError:
@@ -521,7 +574,7 @@ class WildberriesEnterpriseEngine:
             candidates = [primary_b]
             for offset in (-1, 1, -2, 2, 3, -3, 4, 5):
                 c_num = primary_int + offset
-                if 1 <= c_num <= 42:
+                if 1 <= c_num <= 45:
                     c_str = f"{c_num:02d}"
                     if c_str not in candidates:
                         candidates.append(c_str)
@@ -559,6 +612,7 @@ class WildberriesEnterpriseEngine:
                 or "Товар Wildberries"
             ).strip()
             subj_name = str(card_data.get("subj_name") or "").strip()
+            imt_id = str(card_data.get("imt_id") or "")
             selling = card_data.get("selling", {})
             brand = str(
                 selling.get("brand_name")
@@ -613,6 +667,7 @@ class WildberriesEnterpriseEngine:
             db.cache_product(str(nm_id), title, brand, subj_name, latest_price)
 
             return {
+                "imt_id": imt_id,
                 "title": title,
                 "brand": brand,
                 "subj_name": subj_name,
@@ -620,10 +675,12 @@ class WildberriesEnterpriseEngine:
                 "min_hist_price": min_price,
                 "max_hist_price": max_price,
                 "avg_hist_price": avg_price,
-                "variants": variants[:12],
+                "variants": variants[:14],
             }
 
-    async def get_product_by_id(self, nm_id: str) -> Tuple[bool, Dict[str, Any]]:
+    async def get_product_by_id(
+        self, nm_id: str, fetch_reviews: bool = True
+    ) -> Tuple[bool, Dict[str, Any]]:
         session = await self.get_session()
         proxy = ProxyManager.pick_proxy()
 
@@ -678,6 +735,14 @@ class WildberriesEnterpriseEngine:
                     and cdn_data.get("latest_hist_price", 0) > 0
                 ):
                     commercial_info["price"] = cdn_data["latest_hist_price"]
+                if (
+                    fetch_reviews
+                    and commercial_info["rating"] <= 0
+                    and cdn_data.get("imt_id")
+                ):
+                    r_val, r_cnt = await self.fetch_feedbacks_rating(cdn_data["imt_id"])
+                    commercial_info["rating"] = r_val
+                    commercial_info["feedbacks"] = r_cnt
 
             db.cache_product(
                 str(nm_id),
@@ -689,16 +754,21 @@ class WildberriesEnterpriseEngine:
             return True, commercial_info
 
         if cdn_data:
+            r_val, r_cnt = (0.0, 0)
+            if fetch_reviews and cdn_data.get("imt_id"):
+                r_val, r_cnt = await self.fetch_feedbacks_rating(cdn_data["imt_id"])
+
             return True, {
                 "id": str(nm_id),
+                "imt_id": cdn_data.get("imt_id", ""),
                 "title": cdn_data["title"],
                 "brand": cdn_data["brand"],
                 "subj_name": cdn_data.get("subj_name", ""),
                 "price": cdn_data.get("latest_hist_price", 0.0),
                 "old_price": cdn_data.get("max_hist_price", 0.0),
                 "discount": 0,
-                "rating": 0.0,
-                "feedbacks": 0,
+                "rating": r_val,
+                "feedbacks": r_cnt,
                 "qty": 0,
                 "history_min": cdn_data.get("min_hist_price", 0.0),
                 "history_max": cdn_data.get("max_hist_price", 0.0),
@@ -709,20 +779,125 @@ class WildberriesEnterpriseEngine:
 
         return False, {"error": "Товар с таким артикулом не найден в базе Wildberries."}
 
+    async def load_static_menu_categories(self) -> List[Dict[str, str]]:
+        """Загружает дерево категорий с незаблокированного CDN static-basket-01.wbbasket.ru."""
+        if self.menu_categories:
+            return self.menu_categories
+
+        session = await self.get_session()
+        menu_urls = [
+            "https://static-basket-01.wbbasket.ru/vol0/data/main-menu-ru-ru-v3.json",
+            "https://static-basket-01.wbbasket.ru/vol0/data/main-menu-ru-ru-v2.json",
+        ]
+
+        def _traverse(nodes: List[Any], parent_name: str = "") -> List[Dict[str, str]]:
+            flat: List[Dict[str, str]] = []
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                name = str(node.get("name") or "").strip()
+                full_label = f"{parent_name} {name}".strip()
+                shard = str(node.get("shard") or "").strip()
+                query_param = str(node.get("query") or "").strip()
+                if shard and query_param and shard != "blackhole":
+                    flat.append(
+                        {
+                            "name": name.lower(),
+                            "full": full_label.lower(),
+                            "shard": shard,
+                            "query": query_param,
+                        }
+                    )
+                childs = node.get("childs")
+                if isinstance(childs, list) and childs:
+                    flat.extend(_traverse(childs, full_label))
+            return flat
+
+        for url in menu_urls:
+            try:
+                async with session.get(
+                    url, headers=get_spoofed_headers(), timeout=6.0
+                ) as resp:
+                    if resp.status == 200:
+                        raw_menu = await resp.json(content_type=None)
+                        if isinstance(raw_menu, list):
+                            self.menu_categories = _traverse(raw_menu)
+                            logger.info(
+                                f"Загружено {len(self.menu_categories)} категорий из CDN меню WB."
+                            )
+                            return self.menu_categories
+            except Exception as e:
+                logger.debug(f"Menu CDN load skipped ({url}): {e}")
+        return []
+
+    async def _search_via_category_catalog(
+        self, query: str, wb_sort: str
+    ) -> List[Dict[str, Any]]:
+        """Находит категорию в статическом CDN-меню и запрашивает catalog.wb.ru."""
+        cats = await self.load_static_menu_categories()
+        if not cats:
+            return []
+
+        words = [w.lower() for w in re.findall(r"[а-яА-ЯёЁa-zA-Z]{3,}", query)]
+        if not words:
+            return []
+        stems = [w[:5] if len(w) >= 6 else w[:4] for w in words]
+
+        best_cat: Optional[Dict[str, str]] = None
+        best_score = 0
+        for c in cats:
+            score = 0
+            for w, st in zip(words, stems):
+                if w in c["name"]:
+                    score += 4
+                elif st in c["name"]:
+                    score += 3
+                elif st in c["full"]:
+                    score += 2
+            if score > best_score:
+                best_score = score
+                best_cat = c
+
+        if not best_cat or best_score < 2:
+            return []
+
+        shard = best_cat["shard"]
+        cat_q = best_cat["query"]
+        session = await self.get_session()
+        proxy = ProxyManager.pick_proxy()
+
+        cat_urls = [
+            f"https://catalog.wb.ru/catalog/{shard}/v2/catalog?appType=1&curr=rub&dest=-1257786&spp=30&sort={wb_sort}&{cat_q}",
+            f"https://catalog.wb.ru/catalog/{shard}/v4/catalog?appType=1&curr=rub&dest=-1257786&spp=30&sort={wb_sort}&{cat_q}",
+        ]
+        for u in cat_urls:
+            try:
+                async with session.get(
+                    u, headers=get_spoofed_headers(), proxy=proxy, timeout=5.5
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        prods = self._extract_products(data)
+                        if prods:
+                            return prods
+            except Exception:
+                continue
+        return []
+
     async def _fetch_search_via_relays(
         self, encoded_q: str, wb_sort: str
     ) -> List[Dict[str, Any]]:
-        """Туннелирует запрос к WB Search API через публичные прокси-ретрансляторы в обход блокировки IP Render."""
+        """Туннелирует запрос к WB Search API v4 через публичные прокси-ретрансляторы."""
         session = await self.get_session()
         target_wb_url = (
-            f"https://search.wb.ru/exactmatch/ru/common/v18/search"
-            f"?ab_testing=false&appType=1&curr=rub&dest=-1257786"
+            f"https://search.wb.ru/exactmatch/ru/common/v4/search"
+            f"?appType=1&curr=rub&dest=-1257786&page=1"
             f"&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false"
         )
         relay_urls = [
             f"https://api.codetabs.com/v1/proxy?quest={quote(target_wb_url, safe='')}",
             f"https://api.allorigins.win/raw?url={quote(target_wb_url, safe='')}",
-            f"https://corsproxy.io/?{quote(target_wb_url, safe='')}",
+            f"https://thingproxy.freeboard.io/fetch/{target_wb_url}",
         ]
 
         for r_url in relay_urls:
@@ -735,100 +910,116 @@ class WildberriesEnterpriseEngine:
                         products = self._extract_products(text_body)
                         if products:
                             return products
-            except Exception as e:
-                logger.debug(f"Relay {r_url[:35]} failed: {e}")
+            except Exception:
+                continue
         return []
+
+    @staticmethod
+    def _decode_all_links_and_extract_ids(raw_html: str) -> List[str]:
+        """
+        Декодирует:
+        1) Base64-ссылки Bing (u=a1aHR0cHM6Ly93d3cud2lsZGJlcnJpZXMucnUvY2F0YWxvZy8...)
+        2) Двойной URL-encoding (%252F -> %2F -> /)
+        3) Хлебные крошки поисковиков (wildberries.ru › catalog › 14195461)
+        4) Текстовые сниппеты ('Артикул: 14195461')
+        """
+        decoded_chunks = [unquote(unquote(raw_html))]
+
+        # Расшифровка Base64 редиректов Bing (&u=a1...)
+        for b64_match in re.findall(r"[?&]u=a1([A-Za-z0-9_-]{16,})", raw_html):
+            try:
+                padded = b64_match + "=" * (-len(b64_match) % 4)
+                dec_bytes = base64.urlsafe_b64decode(padded)
+                decoded_chunks.append(dec_bytes.decode("utf-8", errors="ignore"))
+            except Exception:
+                continue
+
+        full_text = "\n".join(decoded_chunks)
+
+        patterns = [
+            re.compile(r"wildberries\.[a-z]+/catalog/(\d{6,12})", re.IGNORECASE),
+            re.compile(r"/catalog/(\d{6,12})/detail", re.IGNORECASE),
+            re.compile(
+                r"catalog\s*(?:/|›|»|&gt;|&#8250;|\s)\s*(\d{6,12})", re.IGNORECASE
+            ),
+            re.compile(r"(?:артикул|арт\.?|sku|nm)[:\s#№]*(\d{7,11})", re.IGNORECASE),
+        ]
+
+        extracted: List[str] = []
+        for rgx in patterns:
+            for match_id in rgx.findall(full_text):
+                if match_id not in extracted:
+                    extracted.append(match_id)
+        return extracted
 
     async def _discover_ids_via_web_index(self, query: str) -> List[str]:
         """
-        Многопоточный парсер поисковых систем (POST + GET) с полным декодированием URL (%2F -> /),
-        извлекающий артикулы Wildberries из редирект-ссылок DuckDuckGo, Yahoo и Bing.
+        Принудительно ищет карточки товаров с окончанием detail.aspx и упоминанием артикулов,
+        исключая пустые ссылки на общие разделы каталога.
         """
         session = await self.get_session()
         clean_q = query.strip()
-        q_site = f"site:wildberries.ru/catalog/ {clean_q}"
-        q_broad = f"wildberries catalog detail {clean_q}"
 
-        found_ids: List[str] = []
-        id_regexes = [
-            re.compile(r"wildberries\.[a-z]+/catalog/(\d{6,12})", re.IGNORECASE),
-            re.compile(r"/catalog/(\d{7,11})/detail", re.IGNORECASE),
-        ]
+        # Запросы с "detail.aspx" и "Артикул" отсекают общие категории без цифр
+        q_detail = f'site:wildberries.ru/catalog inurl:detail.aspx {clean_q}'
+        q_art = f'wildberries "detail.aspx" {clean_q}'
+        q_sku = f'wildberries.ru/catalog "Артикул" {clean_q}'
 
-        def extract_from_html(raw_html: str) -> List[str]:
-            # Декодируем %2F и %3A в обычные слэши, чтобы видеть ссылки внутри редиректов uddg= / RU=
-            decoded = unquote(unquote(raw_html))
-            extracted: List[str] = []
-            for rgx in id_regexes:
-                for m in rgx.findall(decoded):
-                    if m not in extracted:
-                        extracted.append(m)
-            return extracted
-
-        async def post_ddg_html(q_str: str) -> List[str]:
-            headers = get_spoofed_headers("https://html.duckduckgo.com/")
+        async def post_ddg(endpoint: str, q_str: str) -> List[str]:
+            headers = get_spoofed_headers("https://duckduckgo.com/")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
                 async with session.post(
-                    "https://html.duckduckgo.com/html/",
+                    endpoint,
                     data={"q": q_str, "kl": "ru-ru"},
                     headers=headers,
                     timeout=6.0,
                 ) as resp:
                     if resp.status == 200:
-                        return extract_from_html(await resp.text(errors="ignore"))
+                        return self._decode_all_links_and_extract_ids(
+                            await resp.text(errors="ignore")
+                        )
             except Exception:
                 pass
             return []
 
-        async def post_ddg_lite(q_str: str) -> List[str]:
-            headers = get_spoofed_headers("https://lite.duckduckgo.com/")
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-            try:
-                async with session.post(
-                    "https://lite.duckduckgo.com/lite/",
-                    data={"q": q_str, "kl": "ru-ru"},
-                    headers=headers,
-                    timeout=6.0,
-                ) as resp:
-                    if resp.status == 200:
-                        return extract_from_html(await resp.text(errors="ignore"))
-            except Exception:
-                pass
-            return []
-
-        async def get_search_page(url: str) -> List[str]:
+        async def get_engine(url: str) -> List[str]:
             try:
                 async with session.get(
-                    url, headers=get_spoofed_headers("https://www.google.com/"), timeout=6.0
+                    url,
+                    headers=get_spoofed_headers("https://www.google.com/"),
+                    timeout=6.0,
                 ) as resp:
                     if resp.status == 200:
-                        return extract_from_html(await resp.text(errors="ignore"))
+                        return self._decode_all_links_and_extract_ids(
+                            await resp.text(errors="ignore")
+                        )
             except Exception:
                 pass
             return []
 
         tasks = [
-            post_ddg_html(q_site),
-            post_ddg_lite(q_broad),
-            get_search_page(f"https://search.yahoo.com/search?p={quote(q_site)}&n=20"),
-            get_search_page(f"https://search.yahoo.com/search?p={quote(q_broad)}&n=20"),
-            get_search_page(f"https://www.bing.com/search?q={quote(q_site)}&count=20"),
-            get_search_page(f"https://www.bing.com/search?q={quote(q_broad)}&count=20"),
+            get_engine(f"https://www.bing.com/search?q={quote(q_detail)}&count=30"),
+            get_engine(f"https://www.bing.com/search?q={quote(q_art)}&count=30"),
+            get_engine(f"https://www.bing.com/search?q={quote(q_sku)}&count=30"),
+            get_engine(f"https://search.yahoo.com/search?p={quote(q_detail)}&n=30"),
+            get_engine(f"https://search.yahoo.com/search?p={quote(q_art)}&n=30"),
+            post_ddg("https://html.duckduckgo.com/html/", q_detail),
+            post_ddg("https://lite.duckduckgo.com/lite/", q_art),
         ]
 
         results = await asyncio.gather(*tasks)
+        found_ids: List[str] = []
         for id_list in results:
             for nm in id_list:
                 if nm not in found_ids:
                     found_ids.append(nm)
 
-        return found_ids[:16]
+        return found_ids[:18]
 
     async def enrich_items_with_cdn(
         self, items: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Догружает историю цен и недостающие цены через CDN wbbasket для списка товаров."""
         async def _enrich_one(item: Dict[str, Any]) -> Dict[str, Any]:
             cdn = await self.fetch_cdn_basket(item["id"])
             if cdn:
@@ -842,6 +1033,10 @@ class WildberriesEnterpriseEngine:
                 item["history_max"] = cdn.get("max_hist_price", 0.0)
                 item["history_avg"] = cdn.get("avg_hist_price", 0.0)
                 item["subj_name"] = cdn.get("subj_name", "")
+                if item["rating"] <= 0 and cdn.get("imt_id"):
+                    r_val, r_cnt = await self.fetch_feedbacks_rating(cdn["imt_id"])
+                    item["rating"] = r_val
+                    item["feedbacks"] = r_cnt
             return item
 
         enriched = await asyncio.gather(*(_enrich_one(it) for it in items[:10]))
@@ -850,40 +1045,48 @@ class WildberriesEnterpriseEngine:
     async def search_lowest_prices(
         self, raw_query: str, mode: str = "smart"
     ) -> Tuple[bool, List[Dict[str, Any]], str, str]:
-        """
-        Возвращает: (успех, список_товаров, источник_данных, исправленный_запрос).
-        """
         corrected_q = await self.autocorrect_typo(raw_query)
         session = await self.get_session()
         proxy = ProxyManager.pick_proxy()
         encoded_q = quote(corrected_q)
         wb_sort = "popular" if mode == "smart" else "priceup"
 
-        # УРОВЕНЬ 1: Прямой запрос к шлюзам WB Search API
+        # УРОВЕНЬ 1: Проверенные шлюзы v4/search и v9/search с контролируемым повтором при 429
         direct_urls = [
-            f"https://search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-            f"https://u-search.wb.ru/exactmatch/ru/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-            f"https://search.wb.ru/exactmatch/sng/common/v18/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
-            f"https://search.wb.ru/exactmatch/ru/common/v9/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
+            f"https://search.wb.ru/exactmatch/ru/common/v4/search?appType=1&curr=rub&dest=-1257786&page=1&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
+            f"https://search.wb.ru/exactmatch/ru/common/v9/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&page=1&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
+            f"https://u-search.wb.ru/exactmatch/ru/common/v9/search?ab_testing=false&appType=1&curr=rub&dest=-1257786&page=1&query={encoded_q}&resultset=catalog&sort={wb_sort}&spp=30&suppressSpellcheck=false",
         ]
 
         raw_products: List[Dict[str, Any]] = []
-        source_label = "WB Search API v18"
+        source_label = "WB Search API v4/v9"
 
         for url in direct_urls:
-            try:
-                async with session.get(
-                    url, headers=get_spoofed_headers(), proxy=proxy, timeout=5.0
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        raw_products = self._extract_products(data)
-                        if raw_products:
+            for attempt in range(2):
+                try:
+                    async with session.get(
+                        url, headers=get_spoofed_headers(), proxy=proxy, timeout=5.0
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            raw_products = self._extract_products(data)
                             break
-            except Exception:
-                continue
+                        if resp.status == 429 and attempt == 0:
+                            await asyncio.sleep(1.2)
+                            continue
+                        break
+                except Exception:
+                    break
+            if raw_products:
+                break
 
-        # УРОВЕНЬ 2: Публичные API-ретрансляторы (если IP Render заблокирован напрямую)
+        # УРОВЕНЬ 2: Поиск через статическое дерево категорий CDN (main-menu-ru-ru-v3.json)
+        if not raw_products:
+            raw_products = await self._search_via_category_catalog(corrected_q, wb_sort)
+            if raw_products:
+                source_label = "WB CDN Category Tree"
+
+        # УРОВЕНЬ 3: Публичные прокси-ретрансляторы (Relay Gateways)
         if not raw_products:
             raw_products = await self._fetch_search_via_relays(encoded_q, wb_sort)
             if raw_products:
@@ -913,7 +1116,7 @@ class WildberriesEnterpriseEngine:
                     top_slice.sort(key=lambda x: x["price"])
                     return True, top_slice, source_label, corrected_q
 
-        # УРОВЕНЬ 3 & 4: Декодирующий Web-Index (POST/GET) + Локальный кэш + CDN wbbasket
+        # УРОВЕНЬ 4 & 5: Декодирующий Base64/Breadcrumb Веб-Индекс (detail.aspx) + Кэш + CDN wbbasket
         candidate_ids = db.search_cached_nm_ids(corrected_q)
         web_ids = await self._discover_ids_via_web_index(corrected_q)
         for wid in web_ids:
@@ -930,7 +1133,10 @@ class WildberriesEnterpriseEngine:
             return False, [], "none", corrected_q
 
         initial_results = await asyncio.gather(
-            *(self.get_product_by_id(nm) for nm in candidate_ids[:14])
+            *(
+                self.get_product_by_id(nm, fetch_reviews=False)
+                for nm in candidate_ids[:15]
+            )
         )
         valid_items: List[Dict[str, Any]] = []
         extra_variant_ids: List[str] = []
@@ -944,7 +1150,10 @@ class WildberriesEnterpriseEngine:
 
         if len(valid_items) < 8 and extra_variant_ids:
             var_results = await asyncio.gather(
-                *(self.get_product_by_id(nm) for nm in extra_variant_ids[:10])
+                *(
+                    self.get_product_by_id(nm, fetch_reviews=False)
+                    for nm in extra_variant_ids[:10]
+                )
             )
             for ok, info in var_results:
                 if ok and info.get("price", 0) > 0:
@@ -954,8 +1163,70 @@ class WildberriesEnterpriseEngine:
             return False, [], "none", corrected_q
 
         unique_map = {item["id"]: item for item in valid_items}
-        sorted_items = sorted(unique_map.values(), key=lambda x: x["price"])
-        return True, sorted_items[:8], "CDN + Гибридный Веб-Индекс", corrected_q
+        sorted_items = sorted(unique_map.values(), key=lambda x: x["price"])[:8]
+
+        # Догружаем живые рейтинги для топ-выдачи с feedbacks1.wb.ru
+        for it in sorted_items:
+            if it.get("rating", 0) <= 0 and it.get("imt_id"):
+                r_val, r_cnt = await self.fetch_feedbacks_rating(it["imt_id"])
+                it["rating"] = r_val
+                it["feedbacks"] = r_cnt
+
+        return True, sorted_items, "CDN + Base64 Detail-Индекс", corrected_q
+
+    async def run_diagnostics(self) -> str:
+        """Проверяет доступность всех 6 узлов с текущего сервера Render."""
+        session = await self.get_session()
+        proxy = ProxyManager.pick_proxy()
+        checks = []
+
+        async def _probe(label: str, url: str, use_proxy: bool = False) -> str:
+            t0 = time.monotonic()
+            try:
+                async with session.get(
+                    url,
+                    headers=get_spoofed_headers(),
+                    proxy=proxy if use_proxy else None,
+                    timeout=5.0,
+                ) as resp:
+                    ms = int((time.monotonic() - t0) * 1000)
+                    icon = "🟢" if resp.status == 200 else ("🟡" if resp.status == 429 else "🔴")
+                    return f"{icon} <b>{label}</b>: HTTP {resp.status} ({ms} мс)"
+            except Exception as e:
+                return f"🔴 <b>{label}</b>: {type(e).__name__}"
+
+        results = await asyncio.gather(
+            _probe(
+                "1. CDN wbbasket (Карточки/Цены)",
+                "https://basket-01.wbbasket.ru/vol141/part14195/14195461/info/ru/card.json",
+            ),
+            _probe(
+                "2. Static Menu CDN (Категории)",
+                "https://static-basket-01.wbbasket.ru/vol0/data/main-menu-ru-ru-v3.json",
+            ),
+            _probe(
+                "3. Feedbacks API (Рейтинги)",
+                "https://feedbacks1.wb.ru/feedbacks/v1/10597558",
+            ),
+            _probe(
+                "4. Card API v4 (Остатки)",
+                "https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm=14195461",
+                use_proxy=True,
+            ),
+            _probe(
+                "5. WB Search API v4",
+                "https://search.wb.ru/exactmatch/ru/common/v4/search?appType=1&curr=rub&dest=-1257786&query=термос&resultset=catalog",
+                use_proxy=True,
+            ),
+        )
+        checks.extend(results)
+
+        web_ids = await self._discover_ids_via_web_index("комбинезон женский")
+        w_icon = "🟢" if web_ids else "🟡"
+        checks.append(
+            f"{w_icon} <b>6. Base64 Detail-Индекс</b>: найдено {len(web_ids)} арт."
+        )
+        return "\n".join(checks)
 
 
 wb_engine = WildberriesEnterpriseEngine()
@@ -965,7 +1236,6 @@ wb_engine = WildberriesEnterpriseEngine()
 # 4. АНАЛИТИЧЕСКОЕ ФОРМАТИРОВАНИЕ И ВИЗУАЛИЗАЦИЯ
 # ==========================================
 def build_price_thermometer(curr: float, h_min: float, h_max: float) -> str:
-    """Строит визуальную шкалу положения текущей цены между историческим дном и пиком."""
     if curr <= 0 or h_min <= 0 or h_max <= h_min:
         return ""
     ratio = max(0.0, min(1.0, (curr - h_min) / (h_max - h_min)))
@@ -1049,10 +1319,10 @@ def format_product_card(info: Dict[str, Any], target_price: float = 0.0) -> str:
     stock_str = (
         f"🟢 В наличии ({info['qty']} шт.)"
         if info["qty"] > 0
-        else "⚪ Остаток по региональному складу CDN"
+        else "⚪ По данным регионального CDN"
     )
     rating_line = (
-        f"⭐ Рейтинг: <b>{info['rating']}</b> ({info['feedbacks']} отз.)\n"
+        f"⭐ Рейтинг: <b>{info['rating']:.1f}</b> ({info['feedbacks']} отз.)\n"
         if info["rating"] > 0
         else ""
     )
@@ -1082,7 +1352,7 @@ def format_search_results(
 ) -> str:
     safe_q = html.escape(corrected_query)
     typo_note = (
-        f"✨ <i>Автоисправление опечатки: «{html.escape(raw_query)}» ➡️ «{safe_q}»</i>\n"
+        f"✨ <i>Исправлена опечатка: «{html.escape(raw_query)}» ➡️ «{safe_q}»</i>\n"
         if corrected_query.lower() != raw_query.strip().lower()
         else ""
     )
@@ -1103,7 +1373,11 @@ def format_search_results(
         price_str = f"{item['price']:,.0f}".replace(",", " ")
         h_min = item.get("history_min", 0.0)
         min_tag = f" (мин. был {int(h_min)}₽)" if h_min > 0 else ""
-        rating_tag = f" | ⭐ {item['rating']}" if item["rating"] > 0 else ""
+        rating_tag = (
+            f" | ⭐ {item['rating']:.1f} ({item['feedbacks']})"
+            if item.get("rating", 0) > 0
+            else ""
+        )
 
         lines.append(
             f"<b>{idx}. {price_str} ₽</b>{min_tag}{rating_tag}\n"
@@ -1128,11 +1402,12 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="🔄 Проверить скидки сейчас"),
             ],
             [
+                KeyboardButton(text="🧪 Диагностика сети"),
                 KeyboardButton(text="💾 Бэкап и Прокси"),
-                KeyboardButton(text="⚙️ Статус бота"),
             ],
             [
                 KeyboardButton(text="🔍 Как пользоваться ботом?"),
+                KeyboardButton(text="⚙️ Статус бота"),
             ],
         ],
         resize_keyboard=True,
@@ -1258,10 +1533,10 @@ router = Router()
 async def cmd_start(message: Message):
     WAITING_TARGET_PRICE.pop(message.from_user.id, None)
     text = (
-        "🛍️ <b>WB Радар Цен — Enterprise Edition (10/10)</b>\n\n"
+        "🛍️ <b>WB Радар Цен — Enterprise v6 (10/10)</b>\n\n"
         "Отправьте в чат любой запрос:\n"
-        "1️⃣ <b>Название товара</b> (например: <code>Комбинезон женский</code>) — 5-уровневый поиск самых низких цен с автоисправлением опечаток.\n"
-        "2️⃣ <b>Артикул или ссылку WB</b> (например: <code>14195461</code>) — рентген истории цен, шкала выгоды и сканер дешевых цветов.\n"
+        "1️⃣ <b>Название товара</b> (например: <code>Комбинезон женский</code>) — 6-уровневый поиск самых низких цен с Base64-декодером и автоисправлением опечаток.\n"
+        "2️⃣ <b>Артикул или ссылку WB</b> (например: <code>14195461</code>) — рентген истории цен, живой рейтинг и сканер дешевых цветов.\n"
         "3️⃣ <b>Артикул + желаемая цена</b> (например: <code>14195461 280</code>) — установка снайпер-цели!"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -1308,7 +1583,7 @@ async def cmd_proxy(message: Message):
     if len(parts) < 2 or parts[1].strip().lower() in ("off", "clear", "none", "0"):
         db.set_setting("proxy_pool", "")
         await message.answer(
-            "🌐 Пользовательский прокси отключен. Активен встроенный 5-уровневый Relay + CDN обход."
+            "🌐 Пользовательский прокси отключен. Активен 6-уровневый CDN + Base64 Detail-Индекс."
         )
         return
 
@@ -1332,14 +1607,26 @@ async def cmd_proxy(message: Message):
     )
 
 
+@router.message(F.text == "🧪 Диагностика сети")
+async def cmd_diagnostics(message: Message):
+    wait_msg = await message.answer("⏳ Проверяю отклик всех 6 узлов Wildberries...")
+    diag_report = await wb_engine.run_diagnostics()
+    await wait_msg.delete()
+    await message.answer(
+        f"🧪 <b>Диагностика каналов связи с сервера Render:</b>\n\n{diag_report}",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(),
+    )
+
+
 @router.message(F.text == "🔍 Как пользоваться ботом?")
 async def cmd_help(message: Message):
     text = (
-        "💡 <b>Архитектурные возможности Enterprise-версии:</b>\n\n"
-        "• <b>Автоисправление опечаток:</b> пишите запросы быстро — встроенный модуль Yandex Speller сам исправит опечатки перед поиском.\n"
-        "• <b>🌡️ Шкала выгоды:</b> визуальный индикатор показывает, насколько текущая цена близка к историческому дну.\n"
-        "• <b>🎨 Сравнение цветов и категории:</b> кнопки под карточкой находят самый дешевый цвет в линейке или самые дешевые аналоги в той же категории.\n"
-        "• <b>🎯 Снайпер цены:</b> задайте желаемую цену в рублях, и фоновый радар пришлет экстренное уведомление при пробое уровня."
+        "💡 <b>Возможности Enterprise v6:</b>\n\n"
+        "• <b>6-уровневый поиск:</b> сочетает API v4, статическое дерево категорий CDN, прокси-ретрансляторы и Base64-декодер карточек `detail.aspx`.\n"
+        "• <b>🌡️ Шкала выгоды и живые отзывы:</b> соединяет историю цен с сервером отзывов `feedbacks1.wb.ru`.\n"
+        "• <b>🎨 Сравнение цветов и категории:</b> находит самый дешевый цвет в линейке продавца.\n"
+        "• <b>🧪 Диагностика сети:</b> показывает в реальном времени пинг до всех шлюзов WB."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
@@ -1357,7 +1644,7 @@ async def cmd_backup_and_proxy(message: Message):
     proxy_label = (
         f"Активно ({len(active_proxies)} шт.): {active_proxies[0]}"
         if active_proxies
-        else "Встроенный Relay Gateway + Декодер Индекса"
+        else "6-Tier (CDN Menu + Relay + Base64 Detail Decoder)"
     )
     text = (
         "💾 <b>Резервная копия ваших товаров:</b>\n"
@@ -1379,13 +1666,13 @@ async def cmd_status(message: Message):
     net_mode = (
         f"Пул прокси ({len(active_proxies)} шт.) + CDN"
         if active_proxies
-        else "5-Tier (API v18 + Relay Gateways + Unquoted Web-Index + CDN)"
+        else "6-Tier (v4 Search + CDN Menu + Base64 Decoder)"
     )
     text = (
-        "⚙️ <b>Статус системы (Enterprise 10/10):</b>\n\n"
+        "⚙️ <b>Статус системы (Enterprise v6):</b>\n\n"
         f"📂 База данных: <b>SQLite WAL ({DB_PATH.name})</b>\n"
         f"⭐ Товаров на мониторинге: <b>{len(items)} шт.</b>\n"
-        "🧠 Корректор опечаток: <b>Yandex Speller (Активен)</b>\n"
+        "🧠 Корректор опечаток: <b>Локальный словарь + Yandex Speller</b>\n"
         f"🛡️ Сетевой стек: <b>{net_mode}</b>\n"
         "🔔 Фоновый радар скидок: <b>Каждые 30 минут (24/7)</b>"
     )
@@ -1439,7 +1726,7 @@ async def manual_check_discounts(message: Message):
     report = ["📊 <b>Отчет по ценам избранного:</b>\n"]
 
     for nm_id, title, _, old_saved_price, _, target_p in items:
-        ok, info = await wb_engine.get_product_by_id(nm_id)
+        ok, info = await wb_engine.get_product_by_id(nm_id, fetch_reviews=False)
         t_safe = html.escape(title[:35])
         if not ok or info["price"] <= 0:
             report.append(f"⚪ <code>{nm_id}</code> ({t_safe}) — нет в наличии")
@@ -1481,7 +1768,7 @@ async def manual_check_discounts(message: Message):
 @router.callback_query(F.data.startswith("fav_add:"))
 async def cb_add_favorite(callback: CallbackQuery):
     nm_id = callback.data.split(":")[1]
-    ok, info = await wb_engine.get_product_by_id(nm_id)
+    ok, info = await wb_engine.get_product_by_id(nm_id, fetch_reviews=False)
 
     if ok:
         db.save_item(
@@ -1503,7 +1790,7 @@ async def cb_add_favorite(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("target_ask:"))
 async def cb_ask_target_price(callback: CallbackQuery):
     nm_id = callback.data.split(":")[1]
-    ok, info = await wb_engine.get_product_by_id(nm_id)
+    ok, info = await wb_engine.get_product_by_id(nm_id, fetch_reviews=False)
     if ok:
         db.save_item(
             callback.from_user.id,
@@ -1528,13 +1815,15 @@ async def cb_check_variants(callback: CallbackQuery):
     nm_id = callback.data.split(":")[1]
     await callback.answer("Сканирую цены всех вариантов в линейке...")
 
-    ok, base_info = await wb_engine.get_product_by_id(nm_id)
+    ok, base_info = await wb_engine.get_product_by_id(nm_id, fetch_reviews=False)
     if not ok or not base_info.get("variants"):
         await callback.message.answer("У этого товара нет других связанных вариантов.")
         return
 
-    all_ids = [nm_id] + base_info["variants"][:11]
-    results = await asyncio.gather(*(wb_engine.get_product_by_id(v) for v in all_ids))
+    all_ids = [nm_id] + base_info["variants"][:12]
+    results = await asyncio.gather(
+        *(wb_engine.get_product_by_id(v, fetch_reviews=False) for v in all_ids)
+    )
 
     valid_variants = [
         info for ok_v, info in results if ok_v and info.get("price", 0) > 0
@@ -1571,7 +1860,7 @@ async def cb_category_search(callback: CallbackQuery):
     cached = db.get_cached_product(nm_id)
     subj_name = cached.get("subj_name") if cached else ""
     if not subj_name:
-        ok, info = await wb_engine.get_product_by_id(nm_id)
+        ok, info = await wb_engine.get_product_by_id(nm_id, fetch_reviews=False)
         subj_name = info.get("subj_name", "") if ok else ""
 
     if not subj_name:
@@ -1759,7 +2048,7 @@ async def handle_user_input(message: Message):
         )
         return
 
-    # 4. 5-уровневый поиск самых низких цен по названию товара
+    # 4. 6-уровневый поиск самых низких цен по названию товара
     if len(text) < 2:
         await message.answer(
             "❓ Напишите название товара (от 2 букв) или пришлите артикул WB.",
@@ -1769,7 +2058,7 @@ async def handle_user_input(message: Message):
 
     LAST_SEARCH_QUERY[user_id] = text
     wait_msg = await message.answer(
-        f"🔎 Проверяю орфографию и ищу самые низкие цены по запросу <b>«{html.escape(text)}»</b>...",
+        f"🔎 Запускаю 6-уровневый поиск цен по запросу <b>«{html.escape(text)}»</b>...",
         parse_mode="HTML",
     )
 
@@ -1780,8 +2069,8 @@ async def handle_user_input(message: Message):
 
     if not ok or not items:
         await message.answer(
-            "😕 Не удалось найти товары по этому текстовому запросу.\n\n"
-            "💡 <b>Быстрое решение:</b> пришлите <b>любой артикул</b> нужного товара из приложения WB и нажмите под карточкой <b>«🎨 Сравнить цвета/варианты»</b>!",
+            "😕 Не удалось получить карточки по этому запросу.\n\n"
+            "💡 Нажмите кнопку <b>«🧪 Диагностика сети»</b> в меню ниже, чтобы проверить статус шлюзов, или пришлите <b>артикул/ссылку</b> на любой товар из приложения WB!",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
@@ -1810,7 +2099,7 @@ async def background_price_watcher(bot: Bot):
 
         logger.info(f"Фоновая ревизия цен для {len(all_items)} позиций...")
         for user_id, nm_id, title, brand, last_price, target_p in all_items:
-            ok, info = await wb_engine.get_product_by_id(nm_id)
+            ok, info = await wb_engine.get_product_by_id(nm_id, fetch_reviews=False)
             if not ok or info["price"] <= 0:
                 continue
 
@@ -1823,9 +2112,7 @@ async def background_price_watcher(bot: Bot):
                 and (last_price > target_p or last_price == 0)
             )
             historical_bottom = (
-                h_min > 0
-                and new_price <= h_min
-                and last_price > new_price
+                h_min > 0 and new_price <= h_min and last_price > new_price
             )
             price_dropped = last_price > 0 and new_price < last_price - 5
 
@@ -1876,11 +2163,11 @@ async def start_render_web_server():
     app = web.Application()
     app.router.add_get(
         "/",
-        lambda request: web.Response(text="WB Enterprise Radar 10/10 is running!"),
+        lambda request: web.Response(text="WB Enterprise Radar v6 is running!"),
     )
     app.router.add_get(
         "/health",
-        lambda request: web.json_response({"status": "ok", "engine": "enterprise_v5"}),
+        lambda request: web.json_response({"status": "ok", "engine": "enterprise_v6"}),
     )
 
     runner = web.AppRunner(app)
@@ -1902,9 +2189,11 @@ async def main():
             "Не найден токен Telegram-бота в переменных окружения (BOT_TOKEN)!"
         )
 
-    # Zero-Conflict Startup: мгновенный бинд порта и пауза для завершения старого инстанса Render
     await start_render_web_server()
     await asyncio.sleep(4)
+
+    # Предзагрузка дерева категорий с CDN в фоновом режиме
+    asyncio.create_task(wb_engine.load_static_menu_categories())
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
@@ -1914,7 +2203,7 @@ async def main():
     asyncio.create_task(keep_alive_ping())
     asyncio.create_task(background_price_watcher(bot))
 
-    logger.info("WB Радар Цен (Enterprise 10/10) запущен!")
+    logger.info("WB Радар Цен (Enterprise v6) запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
